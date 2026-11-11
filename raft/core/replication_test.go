@@ -310,7 +310,7 @@ func TestReorderedShortAppendKeepsLaterEntries(t *testing.T) {
 func TestLogMismatchRejected(t *testing.T) {
 	cases := []struct {
 		name               string
-		prevIndex, prevTer int
+		prevIndex, prevTerm int
 	}{
 		{"prev beyond end", 5, 1},
 		{"prev term differs", 2, 2},
@@ -318,7 +318,7 @@ func TestLogMismatchRejected(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			n := followerWith(2, 2, Entry{1, "a"}, Entry{1, "b"})
-			out := step(t, n, appendEntries(1, 2, 2, c.prevIndex, c.prevTer, []Entry{{2, "x"}}, 2, "1-7"))
+			out := step(t, n, appendEntries(1, 2, 2, c.prevIndex, c.prevTerm, []Entry{{2, "x"}}, 2, "1-7"))
 			want := map[string]any{"from": 1, "msg_id": "1-7", "success": false, "reason": "log_mismatch"}
 			if d := detailsOf(t, out, tracelog.EvRecvAppendEntries); !reflect.DeepEqual(d, want) {
 				t.Errorf("details = %v, want %v", d, want)
@@ -756,5 +756,19 @@ func TestClusterReplicatesAndAppliesInOrder(t *testing.T) {
 	}
 	if err := schemacheck.ValidateJSONL(x); err != nil {
 		t.Errorf("schema: %v", err)
+	}
+}
+
+func TestLeaderStepsDownOnSameTermAppend(t *testing.T) {
+	// Cannot happen in a correct cluster (one leader per term); this pins what
+	// the core does if it ever does.
+	n := leaderOfTerm(t, 1)
+	out := step(t, n, appendEntries(2, 1, 1, 0, 0, []Entry{}, 0, "2-5"))
+	if out.Records[0].Event != tracelog.EvBecomeFollower ||
+		!reflect.DeepEqual(out.Records[0].Details, map[string]any{"old_role": "leader"}) {
+		t.Errorf("first record = %+v, want become_follower {old_role: leader}", out.Records[0])
+	}
+	if st := n.State(); st.Role != "follower" || st.LeaderID != 2 || st.CurrentTerm != 1 {
+		t.Errorf("state = %+v, want follower term 1 leader 2", st)
 	}
 }

@@ -116,12 +116,10 @@ func TestRoleString(t *testing.T) {
 
 func TestStepOnFreshNodeIsEmpty(t *testing.T) {
 	// A fresh follower has nothing to do on a heartbeat tick.
-	for _, ev := range []Event{HeartbeatTimeout{}} {
-		n := New(1, []int{1, 2, 3})
-		out := n.Step(ev)
-		if out.Persist != nil || len(out.Messages) != 0 || len(out.Apply) != 0 || len(out.Records) != 0 {
-			t.Errorf("Step(%T) = %+v, want empty", ev, out)
-		}
+	n := New(1, []int{1, 2, 3})
+	out := n.Step(HeartbeatTimeout{})
+	if out.Persist != nil || len(out.Messages) != 0 || len(out.Apply) != 0 || len(out.Records) != 0 {
+		t.Errorf("Step(HeartbeatTimeout) = %+v, want empty", out)
 	}
 }
 
