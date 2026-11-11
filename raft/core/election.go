@@ -9,10 +9,12 @@ import (
 
 // Leader election: spec §4.5 rules 1-5.
 
-// receive checks that m is addressed to this node from a known peer, applies
-// the higher-term rule, and then hands m to its handler.
+// receive checks that m is addressed to this node from another known peer,
+// applies the higher-term rule, and then hands m to its handler. A message to
+// another node, from an unknown node, or from this node itself is a runner
+// bug, so it panics.
 func (n *Node) receive(m Message) {
-	if _, known := slices.BinarySearch(n.peers, m.From); m.To != n.id || !known {
+	if _, known := slices.BinarySearch(n.peers, m.From); m.To != n.id || !known || m.From == n.id {
 		panic(fmt.Sprintf("core: node %d got message %s for node %d from %d", n.id, m.MsgID, m.To, m.From))
 	}
 	n.observeTerm(m.Term, m.From)
@@ -21,8 +23,10 @@ func (n *Node) receive(m Message) {
 		n.handleRequestVote(m)
 	case MsgRequestVoteReply:
 		n.handleVoteReply(m)
-	case MsgAppendEntries, MsgAppendEntriesReply:
-		// Handled in Task 5.
+	case MsgAppendEntries:
+		n.handleAppendEntries(m)
+	case MsgAppendEntriesReply:
+		n.handleAppendReply(m)
 	default:
 		panic(fmt.Sprintf("core: node %d got message %s with unknown type %d", n.id, m.MsgID, int(m.Type)))
 	}
@@ -31,11 +35,11 @@ func (n *Node) receive(m Message) {
 // observeTerm is the higher-term rule (rule 1). If term > currentTerm it sets
 // currentTerm = term, votedFor = 0 and leaderId = 0, and records update_term
 // {old_term, from}; if the node was a candidate or leader it then becomes a
-// follower and records become_follower {old_role}. It returns true if the
-// term changed. A term <= currentTerm changes nothing.
-func (n *Node) observeTerm(term, from int) bool {
+// follower and records become_follower {old_role}. A term <= currentTerm
+// changes nothing.
+func (n *Node) observeTerm(term, from int) {
 	if term <= n.currentTerm {
-		return false
+		return
 	}
 	old := n.currentTerm
 	n.setTerm(term)
@@ -47,7 +51,6 @@ func (n *Node) observeTerm(term, from int) bool {
 		n.becomeFollower()
 		n.record(tracelog.EvBecomeFollower, map[string]any{"old_role": oldRole.String()})
 	}
-	return true
 }
 
 // becomeFollower sets the role to follower and drops candidate and leader
@@ -140,7 +143,7 @@ func (n *Node) maybeWin() {
 // becomeLeader (rule 5) sets role = leader, leaderId = id, and for every
 // other peer nextIndex = lastIndex+1 and matchIndex = 0; records
 // become_leader {votes: sorted ids}; then queues AppendEntries to each other
-// peer in sorted order, built by appendEntriesFor.
+// peer in sorted order (broadcastAppendEntries).
 func (n *Node) becomeLeader() {
 	votes := []int{}
 	for _, p := range n.peers {
@@ -160,22 +163,5 @@ func (n *Node) becomeLeader() {
 		}
 	}
 	n.record(tracelog.EvBecomeLeader, map[string]any{"votes": votes})
-	for _, p := range n.peers {
-		if p != n.id {
-			n.send(n.appendEntriesFor(p))
-		}
-	}
-}
-
-// appendEntriesFor builds (but does not queue) the AppendEntries for peer p
-// from nextIndex[p]: prevLogIndex = nextIndex[p]-1, its term, the entries
-// from nextIndex[p] on (a copy), and leaderCommit = commitIndex. The caller
-// passes it to send. It panics if nextIndex[p] is outside 1..lastIndex+1.
-func (n *Node) appendEntriesFor(p int) Message {
-	next := n.nextIndex[p]
-	return Message{
-		Type: MsgAppendEntries, To: p, Term: n.currentTerm,
-		PrevLogIndex: next - 1, PrevLogTerm: n.termAt(next - 1),
-		Entries: n.entriesFrom(next), LeaderCommit: n.commitIndex,
-	}
+	n.broadcastAppendEntries()
 }

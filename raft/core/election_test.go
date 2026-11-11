@@ -512,6 +512,7 @@ func TestMisaddressedMessagePanics(t *testing.T) {
 	}
 	expectPanic("wrong To", requestVote(2, 2, 1, 0, 0, "2-1"), "core: node 1 got message 2-1 for node 2 from 2")
 	expectPanic("unknown From", requestVote(9, 1, 1, 0, 0, "9-1"), "core: node 1 got message 9-1 for node 1 from 9")
+	expectPanic("message to itself", appendEntries(1, 1, 1, 0, 0, nil, 0, "1-1"), "core: node 1 got message 1-1 for node 1 from 1")
 	expectPanic("unknown type", Receive{Msg: Message{Type: 99, From: 2, To: 1, MsgID: "2-1"}},
 		"core: node 1 got message 2-1 with unknown type 99")
 }

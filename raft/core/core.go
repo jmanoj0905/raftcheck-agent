@@ -110,8 +110,10 @@ func (n *Node) Step(ev Event) Output {
 		n.electionTimeout()
 	case Receive:
 		n.receive(ev.Msg)
-	case HeartbeatTimeout, Propose:
-		// Handlers arrive in Task 5.
+	case HeartbeatTimeout:
+		n.heartbeatTimeout()
+	case Propose:
+		n.propose(ev.Command)
 	default:
 		panic(fmt.Sprintf("core: unknown event %T", ev))
 	}
