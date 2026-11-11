@@ -1,0 +1,34 @@
+# Go build output and coverage
+raft/bin/
+*.test
+*.out
+coverage.*
+
+# Python
+__pycache__/
+.venv/
+.pytest_cache/
+
+# Dashboard
+node_modules/
+dashboard/dist/
+dashboard/build/
+
+# Agent output
+runs/
+
+# API keys
+.env
+*.env
+
+# OS and editors
+.DS_Store
+.idea/
+.vscode/
+
+# MIT's official lab files, kept local only (D4)
+raft/mit-official/
+
+# TLC output
+states/
+*.tlc.out
