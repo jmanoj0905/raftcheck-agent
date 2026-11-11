@@ -3,6 +3,7 @@ package node
 import (
 	"bytes"
 	"fmt"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -418,6 +419,9 @@ func TestKillWithBlockedApplyCh(t *testing.T) {
 	before := runtime.NumGoroutine()
 	c := newCluster(t, 1)
 	n := c.make(1, make(chan ApplyMsg)) // unbuffered, never read
+	// This test kills n itself, so cleanup must not call Kill again: on a
+	// regression a second Kill would hang instead of letting the test fail.
+	defer func() { c.nodes[0] = nil }()
 	c.waitLeader(5 * time.Second)
 	for i := range 3 {
 		if idx, _, ok := n.Start(fmt.Sprintf("c%d", i)); !ok || idx != i+1 {
@@ -512,6 +516,30 @@ func TestRestartNeverPersisted(t *testing.T) {
 	}
 	if !slices.Equal(evs, []string{tracelog.EvCrash, tracelog.EvRestart, tracelog.EvCrash}) {
 		t.Errorf("events %v, want crash, restart, crash", evs)
+	}
+}
+
+// TestRestartDrainsInbox: messages sent to a node's previous life are not
+// handled by the restarted node.
+func TestRestartDrainsInbox(t *testing.T) {
+	c := newCluster(t, 3)
+	c.cfg.ElectionMin, c.cfg.ElectionMax = time.Hour, time.Hour // quiet cluster
+	c.make(1, make(chan ApplyMsg, 10))
+	c.nodes[0].Kill()
+	// While node 1 is down, a candidate in a far-ahead term asks for its vote.
+	c.net.Send(core.Message{Type: core.MsgRequestVote, From: 2, To: 1, MsgID: "2-1", Term: 99})
+	if len(c.net.Inbox(1)) != 1 {
+		t.Fatalf("inbox holds %d messages before restart, want 1", len(c.net.Inbox(1)))
+	}
+	c.make(1, make(chan ApplyMsg, 10))
+	time.Sleep(200 * time.Millisecond) // time to (wrongly) handle it
+	if term, _ := c.nodes[0].GetState(); term != 0 {
+		t.Errorf("restarted node is in term %d: it handled a message sent to its previous life", term)
+	}
+	for _, r := range nodeRecords(c.sink, 1) {
+		if r.Term == 99 {
+			t.Errorf("record %s in term 99 after restart", r.Event)
+		}
 	}
 }
 
@@ -640,16 +668,47 @@ func TestMemNetworkDelayAndDisconnectInFlight(t *testing.T) {
 	if got != 20 {
 		t.Fatalf("delivered %d of 20 delayed messages", got)
 	}
+
 	// Disconnect after send but before delivery: dropped at delivery time.
-	net.SetMaxDelay(200 * time.Millisecond)
-	for i := range 20 {
-		net.Send(msg(1, 2, fmt.Sprintf("1-%d", 100+i)))
+	// A twin of the network's random source tells us each message's delay,
+	// so no timing guess is needed: a message whose delay is longer than
+	// the time from the first Send to the end of Disconnect cannot have
+	// been delivered before the link went down. The receiver stays
+	// disconnected, so a timer that fires late can only be dropped.
+	const maxDelay = 50 * time.Millisecond
+	net = NewMemNetwork([]int{1, 2}, 0)
+	net.rng = rand.New(rand.NewPCG(7, 7))
+	twin := rand.New(rand.NewPCG(7, 7))
+	net.SetMaxDelay(maxDelay)
+	delays := map[string]time.Duration{}
+	t0 := time.Now()
+	for i := range 40 {
+		id := fmt.Sprintf("1-%d", i+1)
+		delays[id] = time.Duration(twin.Int64N(int64(maxDelay)))
+		net.Send(msg(1, 2, id))
 	}
 	net.Disconnect(2)
-	time.Sleep(300 * time.Millisecond)
-	net.Connect(2)
-	if m, ok := recvMsg(net.Inbox(2), 50*time.Millisecond); ok {
-		t.Fatalf("message %s delivered to a node disconnected in flight", m.MsgID)
+	cut := time.Since(t0)
+	late := 0
+	for _, d := range delays {
+		if d > cut {
+			late++
+		}
+	}
+	if late < 20 {
+		t.Fatalf("only %d of 40 messages are still in flight at the cut (%v); the test proves nothing", late, cut)
+	}
+	time.Sleep(maxDelay + 450*time.Millisecond) // let the timers fire
+	for drained := false; !drained; {
+		select {
+		case m := <-net.Inbox(2):
+			if delays[m.MsgID] > cut {
+				t.Errorf("message %s (delay %v, cut at %v) delivered to a node disconnected in flight",
+					m.MsgID, delays[m.MsgID], cut)
+			}
+		default:
+			drained = true
+		}
 	}
 }
 
