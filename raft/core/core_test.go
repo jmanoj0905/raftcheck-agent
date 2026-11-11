@@ -15,7 +15,7 @@ func emptyFollowerState() tracelog.State {
 	}
 }
 
-func eventsOf(out Output) []string {
+func recordEvents(out Output) []string {
 	evs := []string{}
 	for _, r := range out.Records {
 		evs = append(evs, r.Event)
@@ -71,7 +71,6 @@ func TestStateIsCopy(t *testing.T) {
 	n.appendEntry(Entry{Term: 1, Command: "a"})
 	st := n.State()
 	st.Log[0] = tracelog.LogPair{Term: 9, Command: "changed"}
-	_ = append(st.Log, tracelog.LogPair{Term: 9, Command: "extra"})
 	if got := n.State().Log; !reflect.DeepEqual(got, []tracelog.LogPair{{Term: 1, Command: "a"}}) {
 		t.Errorf("State().Log after mutation = %v", got)
 	}
@@ -116,8 +115,8 @@ func TestRoleString(t *testing.T) {
 }
 
 func TestStepOnFreshNodeIsEmpty(t *testing.T) {
-	// Placeholder until Tasks 4-5: every event yields an empty output.
-	for _, ev := range []Event{ElectionTimeout{}, HeartbeatTimeout{}, Propose{Command: "x"}} {
+	// Placeholder until Task 5: these events yield an empty output.
+	for _, ev := range []Event{HeartbeatTimeout{}, Propose{Command: "x"}} {
 		n := New(1, []int{1, 2, 3})
 		out := n.Step(ev)
 		if out.Persist != nil || len(out.Messages) != 0 || len(out.Apply) != 0 || len(out.Records) != 0 {
@@ -208,7 +207,7 @@ func TestFinishOrder(t *testing.T) {
 		tracelog.EvBecomeCandidate, tracelog.EvPersist,
 		tracelog.EvSendRequestVote, tracelog.EvSendAppendEntries, tracelog.EvApplyEntry,
 	}
-	if got := eventsOf(out); !reflect.DeepEqual(got, wantEvents) {
+	if got := recordEvents(out); !reflect.DeepEqual(got, wantEvents) {
 		t.Fatalf("events = %v, want %v", got, wantEvents)
 	}
 	for i, r := range out.Records {

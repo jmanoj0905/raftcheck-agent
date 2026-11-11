@@ -23,12 +23,13 @@ type Node struct {
 	log         []Entry // log[0] is index 1
 
 	// Volatile.
-	role        Role
-	commitIndex int
-	lastApplied int
-	leaderID    int         // 0 = unknown
-	nextIndex   map[int]int // leaders only; keyed by peer id
-	matchIndex  map[int]int // leaders only; keyed by peer id
+	role         Role
+	commitIndex  int
+	lastApplied  int
+	leaderID     int          // 0 = unknown
+	votesGranted map[int]bool // candidates only; ids that granted a vote (incl. self)
+	nextIndex    map[int]int  // leaders only; keyed by peer id
+	matchIndex   map[int]int  // leaders only; keyed by peer id
 
 	counters Counters
 
@@ -104,9 +105,13 @@ func (n *Node) State() tracelog.State {
 
 // Step handles one event and returns what the caller must do.
 func (n *Node) Step(ev Event) Output {
-	switch ev.(type) {
-	case ElectionTimeout, HeartbeatTimeout, Receive, Propose:
-		// Handlers arrive in Tasks 4 and 5.
+	switch ev := ev.(type) {
+	case ElectionTimeout:
+		n.electionTimeout()
+	case Receive:
+		n.receive(ev.Msg)
+	case HeartbeatTimeout, Propose:
+		// Handlers arrive in Task 5.
 	default:
 		panic(fmt.Sprintf("core: unknown event %T", ev))
 	}
