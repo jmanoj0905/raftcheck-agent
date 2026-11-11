@@ -16,9 +16,11 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/jmanoj0905/raftcheck-agent/raft/core"
 	"github.com/jmanoj0905/raftcheck-agent/raft/internal/schemacheck"
 	"github.com/jmanoj0905/raftcheck-agent/raft/node"
 	"github.com/jmanoj0905/raftcheck-agent/raft/tracelog"
@@ -52,7 +54,7 @@ type cluster struct {
 	n     int
 	ids   []int
 	seed  uint64
-	net   *node.MemNetwork
+	net   *countingNet
 	p     *node.MemPersister
 	sinks []*timedSink // index id-1
 	begin time.Time
@@ -91,7 +93,7 @@ func newCluster(t *testing.T, n int, reliable bool) *cluster {
 		n:         n,
 		ids:       ids,
 		seed:      seed,
-		net:       node.NewMemNetwork(ids, seed),
+		net:       &countingNet{MemNetwork: node.NewMemNetwork(ids, seed)},
 		p:         node.NewMemPersister(),
 		sinks:     make([]*timedSink, n),
 		begin:     time.Now(),
@@ -130,12 +132,19 @@ func (c *cluster) setErr(err error) {
 // checkApplyErr fails the test if any reader recorded an error.
 func (c *cluster) checkApplyErr() {
 	c.t.Helper()
-	c.mu.Lock()
-	err := c.applyErr
-	c.mu.Unlock()
-	if err != nil {
-		c.t.Fatalf("apply check: %v", err)
+	if err := c.applyError(); err != nil {
+		c.t.Fatal(err)
 	}
+}
+
+// applyError returns the first error any reader recorded, or nil.
+func (c *cluster) applyError() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.applyErr != nil {
+		return fmt.Errorf("apply check: %w", c.applyErr)
+	}
+	return nil
 }
 
 // read drains applyCh for one incarnation of node id until stop is closed.
@@ -255,8 +264,29 @@ func (c *cluster) setUnreliable(unreliable bool) {
 	}
 }
 
-// rpcTotal returns how many messages have been sent so far.
+// rpcTotal returns how many messages have been sent so far, replies
+// included.
 func (c *cluster) rpcTotal() int64 { return c.net.MessageCount() }
+
+// rpcCount returns how many requests (RequestVote and AppendEntries) have
+// been sent so far: the number of RPCs, in MIT's terms, where a request and
+// its reply are one RPC.
+func (c *cluster) rpcCount() int64 { return c.net.requests.Load() }
+
+// countingNet is a MemNetwork that also counts requests. Everything but
+// Send comes from the embedded MemNetwork, so it is still a node.Restarter.
+type countingNet struct {
+	*node.MemNetwork
+	requests atomic.Int64
+}
+
+// Send counts m if it is a request, then sends it.
+func (n *countingNet) Send(m core.Message) {
+	if m.Type == core.MsgRequestVote || m.Type == core.MsgAppendEntries {
+		n.requests.Add(1)
+	}
+	n.MemNetwork.Send(m)
+}
 
 // live returns the running, connected nodes by id. Crashed nodes are always
 // disconnected, and a killed node's GetState keeps its last answer, so only
@@ -327,6 +357,7 @@ func (c *cluster) checkTerms() int {
 		if term == -1 {
 			term = t
 		} else if t != term {
+			c.dumpTermChange(min(t, term))
 			c.t.Fatalf("connected nodes disagree on the term: node %d is in %d, another in %d", id, t, term)
 		}
 	}
@@ -337,27 +368,35 @@ func (c *cluster) checkTerms() int {
 // entry at index, and its command. It fails if they applied different ones.
 func (c *cluster) nCommitted(index int) (count int, cmd string) {
 	c.t.Helper()
-	c.checkApplyErr()
+	count, cmd, err := c.nCommittedErr(index)
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	return count, cmd
+}
+
+// nCommittedErr is nCommitted for goroutines other than the test's own: it
+// returns the failure instead of calling Fatal.
+func (c *cluster) nCommittedErr(index int) (count int, cmd string, err error) {
+	if err := c.applyError(); err != nil {
+		return 0, "", err
+	}
 	var first applied
-	var clash error
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	for i, log := range c.logs {
 		e, ok := log[index]
 		if !ok {
 			continue
 		}
-		if count > 0 && e != first && clash == nil {
-			clash = fmt.Errorf("committed values differ at index %d: node %d has %q (term %d), another has %q (term %d)",
+		if count > 0 && e != first && err == nil {
+			err = fmt.Errorf("committed values differ at index %d: node %d has %q (term %d), another has %q (term %d)",
 				index, i+1, e.cmd, e.term, first.cmd, first.term)
 		}
 		first = e
 		count++
 	}
-	c.mu.Unlock()
-	if clash != nil {
-		c.t.Fatal(clash)
-	}
-	return count, first.cmd
+	return count, first.cmd, err
 }
 
 // one submits cmd to whichever connected node is leader, and waits for at
@@ -366,10 +405,22 @@ func (c *cluster) nCommitted(index int) (count int, cmd string) {
 // Gives up after 10 s. Returns the index the command was committed at.
 func (c *cluster) one(cmd string, expected int, retry bool) int {
 	c.t.Helper()
+	index, err := c.tryOne(cmd, expected, retry)
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	return index
+}
+
+// tryOne is one for goroutines other than the test's own: it returns the
+// failure instead of calling Fatal.
+func (c *cluster) tryOne(cmd string, expected int, retry bool) (int, error) {
 	t0 := time.Now()
 	next := 0 // round-robin over nodes, as in the MIT tester
 	for time.Since(t0) < oneBudget {
-		c.checkApplyErr()
+		if err := c.applyError(); err != nil {
+			return -1, err
+		}
 		index := -1
 		for range c.n {
 			next = next%c.n + 1
@@ -388,20 +439,23 @@ func (c *cluster) one(cmd string, expected int, retry bool) int {
 		if index != -1 {
 			t1 := time.Now()
 			for time.Since(t1) < 2*time.Second {
-				if nd, got := c.nCommitted(index); nd > 0 && nd >= expected && got == cmd {
-					return index
+				nd, got, err := c.nCommittedErr(index)
+				if err != nil {
+					return -1, err
+				}
+				if nd > 0 && nd >= expected && got == cmd {
+					return index, nil
 				}
 				time.Sleep(20 * time.Millisecond)
 			}
 			if !retry {
-				c.t.Fatalf("one(%q) failed to reach agreement", cmd)
+				return -1, fmt.Errorf("one(%q) failed to reach agreement", cmd)
 			}
 		} else {
 			time.Sleep(50 * time.Millisecond)
 		}
 	}
-	c.t.Fatalf("one(%q) failed to reach agreement in %v", cmd, oneBudget)
-	return -1
+	return -1, fmt.Errorf("one(%q) failed to reach agreement in %v", cmd, oneBudget)
 }
 
 // wait waits for at least n nodes to apply index and returns its command.
@@ -431,6 +485,20 @@ func (c *cluster) wait(index, n, startTerm int) string {
 		c.t.Fatalf("only %d nodes committed index %d, want %d", nd, index, n)
 	}
 	return cmd
+}
+
+// get returns the running incarnation of node id, or nil if it is crashed.
+func (c *cluster) get(id int) *node.Node {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.nodes[id-1]
+}
+
+// isConnected reports whether node id is running and on the network.
+func (c *cluster) isConnected(id int) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.nodes[id-1] != nil && c.connected[id-1]
 }
 
 // running returns every node that is not crashed, connected or not.
@@ -463,8 +531,15 @@ func (c *cluster) cleanup() {
 	if err != nil {
 		c.t.Errorf("apply check: %v", err)
 	}
+	// One goroutine per node: the schema checks are the slow part of cleanup.
+	sinkErrs := make([]error, len(c.sinks))
+	var wg sync.WaitGroup
 	for i, s := range c.sinks {
-		if err := checkSink(i+1, &s.MemorySink); err != nil {
+		wg.Go(func() { sinkErrs[i] = checkSink(i+1, &s.MemorySink) })
+	}
+	wg.Wait()
+	for i, err := range sinkErrs {
+		if err != nil {
 			c.t.Errorf("node %d sink: %v", i+1, err)
 		}
 	}
@@ -472,16 +547,24 @@ func (c *cluster) cleanup() {
 	c.mu.Lock()
 	starts := c.nStarts
 	c.mu.Unlock()
-	c.t.Logf("%d nodes, %v, %d messages, %d commands started",
-		c.n, time.Since(c.begin).Round(time.Millisecond), c.rpcTotal(), starts)
+	c.t.Logf("%d nodes, %v, %d messages (%d requests), %d commands started",
+		c.n, time.Since(c.begin).Round(time.Millisecond), c.rpcTotal(), c.rpcCount(), starts)
 }
 
-// checkSink validates one node's JSONL against the schema and checks its
+// logKeep is how many entries from each end of a record's log the schema
+// check sees (see checkSink).
+const logKeep = 2
+
+// checkSink validates one node's records against the schema and checks its
 // seqs run 1, 2, 3, ... across all of its incarnations.
+//
+// Every record carries the node's whole log, so validating the records as
+// written costs records × log length, which under -race takes minutes for
+// the long scenarios (Backup, Figure 8). The schema's only rule on a log
+// entry beyond its Go type (LogPair always encodes as [int, string]) is
+// term >= 1, so that is checked here for every entry, and the schema sees
+// each record with its log cut to the first and last logKeep entries.
 func checkSink(id int, s *node.MemorySink) error {
-	if err := schemacheck.ValidateJSONL(s.JSONL()); err != nil {
-		return err
-	}
 	var errs []error
 	want := int64(1)
 	for _, r := range s.Records() {
@@ -493,6 +576,29 @@ func checkSink(id int, s *node.MemorySink) error {
 			want = r.Seq
 		}
 		want++
+
+		log := r.State.Log
+		for i, e := range log {
+			if e.Term < 1 {
+				errs = append(errs, fmt.Errorf("seq %d: log entry %d has term %d", r.Seq, i+1, e.Term))
+				break
+			}
+		}
+		if len(log) > 2*logKeep {
+			// r is a copy, but its Log is shared with the sink: build a new one.
+			r.State.Log = slices.Concat(log[:logKeep], log[len(log)-logKeep:])
+		}
+		line, err := tracelog.Marshal(r)
+		if err == nil {
+			err = schemacheck.ValidateLine(line)
+		}
+		if err != nil {
+			errs = append(errs, fmt.Errorf("seq %d: %w", r.Seq, err))
+		}
+		if len(errs) > 10 {
+			errs = append(errs, errors.New("more errors not shown"))
+			break
+		}
 	}
 	return errors.Join(errs...)
 }

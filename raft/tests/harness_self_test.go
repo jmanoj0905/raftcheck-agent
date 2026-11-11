@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/jmanoj0905/raftcheck-agent/raft/node"
+	"github.com/jmanoj0905/raftcheck-agent/raft/tracelog"
 )
 
 // Tests of the harness itself (not scenarios): the apply checker catches
@@ -92,5 +93,56 @@ func TestTermChangeReport(t *testing.T) {
 	}
 	if strings.Contains(r, fmt.Sprintf("node %d left", leader)) {
 		t.Fatalf("report lists the cut-off leader %d, whose term did not move:\n%s", leader, r)
+	}
+}
+
+// TestCheckSink: checkSink catches a bad term in the middle of a long log
+// (the part the schema does not see), a record the schema rejects, a seq
+// gap and a record from another node, and leaves the sink's records alone.
+func TestCheckSink(t *testing.T) {
+	rec := func(seq int64, log []tracelog.LogPair) tracelog.Record {
+		return tracelog.Record{
+			V: tracelog.Version, Node: 1, Seq: seq, Event: tracelog.EvCrash, Term: 1,
+			Details: map[string]any{},
+			State:   tracelog.State{Role: "follower", CurrentTerm: 1, Log: log},
+		}
+	}
+	long := func(badAt int) []tracelog.LogPair {
+		log := make([]tracelog.LogPair, 20)
+		for i := range log {
+			log[i] = tracelog.LogPair{Term: 1, Command: fmt.Sprint(i)}
+		}
+		if badAt >= 0 {
+			log[badAt].Term = 0
+		}
+		return log
+	}
+	cases := []struct {
+		name    string
+		recs    []tracelog.Record
+		wantErr string
+	}{
+		{"valid", []tracelog.Record{rec(1, long(-1)), rec(2, nil)}, ""},
+		{"term 0 mid-log", []tracelog.Record{rec(1, long(10))}, "log entry 11 has term 0"},
+		{"term 0 at the end", []tracelog.Record{rec(1, long(19))}, "log entry 20 has term 0"},
+		{"schema", []tracelog.Record{func() tracelog.Record { r := rec(1, long(-1)); r.State.Role = "boss"; return r }()}, "seq 1:"},
+		{"seq gap", []tracelog.Record{rec(1, nil), rec(3, nil)}, "seq 3, want 2"},
+		{"other node", []tracelog.Record{func() tracelog.Record { r := rec(1, nil); r.Node = 2; return r }()}, "record from node 2"},
+	}
+	for _, tc := range cases {
+		var s node.MemorySink
+		for _, r := range tc.recs {
+			s.Write(r)
+		}
+		err := checkSink(1, &s)
+		switch {
+		case tc.wantErr == "" && err != nil:
+			t.Errorf("%s: unexpected error %v", tc.name, err)
+		case tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)):
+			t.Errorf("%s: error %v, want one containing %q", tc.name, err, tc.wantErr)
+		}
+		if got := len(s.Records()[0].State.Log); got != len(tc.recs[0].State.Log) {
+			t.Errorf("%s: checkSink changed the stored log (length %d, was %d)", tc.name, got, len(tc.recs[0].State.Log))
+		}
 	}
 }
