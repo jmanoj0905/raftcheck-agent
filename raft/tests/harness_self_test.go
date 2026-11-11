@@ -1,6 +1,7 @@
 package tests
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -69,5 +70,27 @@ func TestHarnessCrashRestart(t *testing.T) {
 	term, _ := c.live()[leader].GetState()
 	if got := c.wait(2, 3, term); got != "b" && got != termMoved {
 		t.Fatalf("wait(2) = %q", got)
+	}
+}
+
+// TestTermChangeReport: after the leader is cut off, the report names the
+// nodes that left the old term, marks the one whose timer fired, and shows
+// timed records.
+func TestTermChangeReport(t *testing.T) {
+	c := newCluster(t, 3, true)
+	leader := c.checkOneLeader()
+	term := c.checkTerms()
+	if r := c.termChangeReport(term); r != "" {
+		t.Fatalf("report before any change: %q", r)
+	}
+	c.disconnect(leader)
+	c.checkOneLeader()
+	r := c.termChangeReport(term)
+	t.Log(r)
+	if !strings.Contains(r, "election timer fired: true") || !strings.Contains(r, `"event":"become_candidate"`) {
+		t.Fatalf("report does not show the election:\n%s", r)
+	}
+	if strings.Contains(r, fmt.Sprintf("node %d left", leader)) {
+		t.Fatalf("report lists the cut-off leader %d, whose term did not move:\n%s", leader, r)
 	}
 }

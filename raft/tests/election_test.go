@@ -24,6 +24,7 @@ func TestInitialElection3A(t *testing.T) {
 	time.Sleep(2 * electionTimeout)
 	term2 := c.checkTerms()
 	if term1 != term2 {
+		c.dumpTermChange(term1)
 		t.Fatalf("term changed from %d to %d even though there were no failures", term1, term2)
 	}
 

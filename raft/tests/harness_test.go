@@ -13,12 +13,15 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"runtime"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/jmanoj0905/raftcheck-agent/raft/internal/schemacheck"
 	"github.com/jmanoj0905/raftcheck-agent/raft/node"
+	"github.com/jmanoj0905/raftcheck-agent/raft/tracelog"
 )
 
 // electionTimeout is how long the tests allow for one election to finish.
@@ -51,7 +54,7 @@ type cluster struct {
 	seed  uint64
 	net   *node.MemNetwork
 	p     *node.MemPersister
-	sinks []*node.MemorySink // index id-1
+	sinks []*timedSink // index id-1
 	begin time.Time
 	goros int // goroutines running before the cluster started
 
@@ -90,7 +93,7 @@ func newCluster(t *testing.T, n int, reliable bool) *cluster {
 		seed:      seed,
 		net:       node.NewMemNetwork(ids, seed),
 		p:         node.NewMemPersister(),
-		sinks:     make([]*node.MemorySink, n),
+		sinks:     make([]*timedSink, n),
 		begin:     time.Now(),
 		goros:     runtime.NumGoroutine(),
 		nodes:     make([]*node.Node, n),
@@ -101,7 +104,7 @@ func newCluster(t *testing.T, n int, reliable bool) *cluster {
 		agreed:    map[int]applied{},
 	}
 	for i := range c.sinks {
-		c.sinks[i] = &node.MemorySink{}
+		c.sinks[i] = &timedSink{}
 		c.logs[i] = map[int]applied{}
 	}
 	t.Cleanup(c.cleanup)
@@ -461,7 +464,7 @@ func (c *cluster) cleanup() {
 		c.t.Errorf("apply check: %v", err)
 	}
 	for i, s := range c.sinks {
-		if err := checkSink(i+1, s); err != nil {
+		if err := checkSink(i+1, &s.MemorySink); err != nil {
 			c.t.Errorf("node %d sink: %v", i+1, err)
 		}
 	}
@@ -511,4 +514,64 @@ func (c *cluster) checkGoroutines(within time.Duration) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostics
+
+// timedSink is a MemorySink that also notes when each record was written.
+// Records carry no wall time, and the times are what tell a scheduler stall
+// (a long silence before an election) apart from a protocol bug.
+type timedSink struct {
+	node.MemorySink
+
+	mu    sync.Mutex
+	times []time.Time // times[i] is when the i-th record arrived
+}
+
+// Write notes the time and stores r. Holding mu across both keeps times
+// and records in the same order.
+func (s *timedSink) Write(r tracelog.Record) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.times = append(s.times, time.Now())
+	s.MemorySink.Write(r)
+}
+
+// dumpTermChange logs termChangeReport(fromTerm).
+func (c *cluster) dumpTermChange(fromTerm int) {
+	c.t.Helper()
+	c.t.Log(c.termChangeReport(fromTerm))
+}
+
+// termChangeReport shows, for every node that reached a term above
+// fromTerm, its records around the change: the 30 before the first record
+// in a later term and up to 30 after, each with its time since the cluster
+// started. Nodes that became candidate (their election timer fired) are
+// marked.
+func (c *cluster) termChangeReport(fromTerm int) string {
+	var b strings.Builder
+	for i, s := range c.sinks {
+		s.mu.Lock()
+		recs, times := s.Records(), slices.Clone(s.times)
+		s.mu.Unlock()
+		first := slices.IndexFunc(recs, func(r tracelog.Record) bool { return r.Term > fromTerm })
+		if first < 0 {
+			continue
+		}
+		timedOut := slices.ContainsFunc(recs[first:], func(r tracelog.Record) bool {
+			return r.Event == tracelog.EvBecomeCandidate
+		})
+		lo, hi := max(0, first-30), min(len(recs), first+30)
+		fmt.Fprintf(&b, "node %d left term %d (election timer fired: %v); records %d-%d of %d:\n",
+			i+1, fromTerm, timedOut, lo+1, hi, len(recs))
+		for j := lo; j < hi; j++ {
+			line, err := tracelog.Marshal(recs[j])
+			if err != nil {
+				line = []byte(err.Error())
+			}
+			fmt.Fprintf(&b, "  +%v %s\n", times[j].Sub(c.begin).Round(time.Millisecond), line)
+		}
+	}
+	return b.String()
 }

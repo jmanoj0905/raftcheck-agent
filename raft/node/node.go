@@ -85,11 +85,17 @@ type startReq struct {
 
 // Make starts node id. peers lists every node id including id. If p holds
 // saved state or counters for id, the node is rebuilt with core.Restore
-// (writing a restart record) and its inbox is drained first, so it never
-// handles messages sent to its previous life; otherwise it starts fresh in
-// term 0. Any
-// earlier Node with this id must be killed first, since both would read the
-// same inbox. Make panics on a bad Config or on peers the core rejects.
+// (writing a restart record); otherwise it starts fresh in term 0.
+//
+// On a restart Make first drops what the previous life left behind: if t
+// is a Restarter (MemNetwork is), t.Restart(id) clears the inbox and every
+// message still in flight to or from the old life, so the new life never
+// handles one. Other transports only get their inbox drained, so a message
+// they deliver late may still arrive.
+//
+// Any earlier Node with this id must be killed first, since both would
+// read the same inbox. Make panics on a bad Config or on peers the core
+// rejects.
 func Make(id int, peers []int, t Transport, p Persister, applyCh chan ApplyMsg, cfg Config) *Node {
 	checkConfig(cfg)
 	n := &Node{
@@ -114,7 +120,11 @@ func Make(id int, peers []int, t Transport, p Persister, applyCh chan ApplyMsg, 
 	// (its crash record bumped LastSeq), so it is a restart too: starting
 	// fresh would reuse seqs.
 	if saved || counters != (core.Counters{}) {
-		drainInbox(t.Inbox(id))
+		if r, ok := t.(Restarter); ok {
+			r.Restart(id)
+		} else {
+			drainInbox(t.Inbox(id))
+		}
 		c, out := core.Restore(id, peers, ps, counters)
 		n.core = c
 		n.process(out)
@@ -129,10 +139,10 @@ func Make(id int, peers []int, t Transport, p Persister, applyCh chan ApplyMsg, 
 	return n
 }
 
-// drainInbox throws away what was waiting in a restarting node's inbox.
-// Those messages were sent to the node's previous life; a real crash loses
-// them with the process. It never blocks: it takes at most the messages
-// queued when it starts.
+// drainInbox throws away what was waiting in a restarting node's inbox, for
+// transports that are not Restarters. Those messages were sent to the
+// node's previous life; a real crash loses them with the process. It never
+// blocks: it takes at most the messages queued when it starts.
 func drainInbox(inbox <-chan core.Message) {
 	for range len(inbox) {
 		select {
