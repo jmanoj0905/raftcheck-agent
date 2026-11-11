@@ -296,13 +296,20 @@ func TestRandomSoak(t *testing.T) {
 
 func TestC10Determinism(t *testing.T) {
 	var sums [3][32]byte
-	for i := range sums {
-		c, err := RandomRun(5, 42, 10000)
-		if err != nil {
-			t.Fatal(err)
+	// The runs share nothing, so they can run in parallel; t.Run returns
+	// once all of them are done.
+	t.Run("runs", func(t *testing.T) {
+		for i := range sums {
+			t.Run(fmt.Sprintf("run%d", i), func(t *testing.T) {
+				t.Parallel()
+				c, err := RandomRun(5, 42, 10000)
+				if err != nil {
+					t.Fatal(err)
+				}
+				sums[i] = sha256.Sum256(c.JSONL())
+			})
 		}
-		sums[i] = sha256.Sum256(c.JSONL())
-	}
+	})
 	if sums[0] != sums[1] || sums[1] != sums[2] {
 		t.Fatalf("JSONL differs between runs: %x %x %x", sums[0], sums[1], sums[2])
 	}
@@ -324,19 +331,71 @@ func TestRecordsMatchSchema(t *testing.T) {
 }
 
 func TestEveryEventTypeAppears(t *testing.T) {
-	seen := map[string]bool{}
-	for seed := int64(1); seed <= 200; seed++ {
-		c, err := RandomRun(3, seed, 2000)
-		if err != nil {
-			t.Fatal(err)
+	const seeds = 200
+	var perSeed [seeds]map[string]bool
+	t.Run("seeds", func(t *testing.T) { // returns once every seed is done
+		for i := range perSeed {
+			t.Run(fmt.Sprintf("seed%d", i+1), func(t *testing.T) {
+				t.Parallel()
+				c, err := RandomRun(3, int64(i+1), 2000)
+				if err != nil {
+					t.Fatal(err)
+				}
+				perSeed[i] = map[string]bool{}
+				for _, r := range c.Records() {
+					perSeed[i][r.Event] = true
+				}
+			})
 		}
-		for _, r := range c.Records() {
-			seen[r.Event] = true
+	})
+	seen := map[string]bool{}
+	for _, m := range perSeed {
+		for ev := range m {
+			seen[ev] = true
 		}
 	}
 	for _, ev := range tracelog.AllEvents {
 		if !seen[ev] {
 			t.Errorf("event %q never appeared", ev)
 		}
+	}
+}
+
+// TestWalkCoverage stops the random walk from quietly going weak: most
+// seeds must commit something, and at 5 nodes the runs must reach commits
+// and log conflicts, or the later safety rules go untested. Measured on
+// 2026-11-11 with seeds 1..50: n=3 50/50 commit, n=5 46/50.
+func TestWalkCoverage(t *testing.T) {
+	const seeds = 50
+	for _, tc := range []struct{ nodes, minCommitting int }{{3, 45}, {5, 35}} {
+		t.Run(fmt.Sprintf("n%d", tc.nodes), func(t *testing.T) {
+			t.Parallel()
+			committing := 0
+			events := map[string]int{}
+			for seed := int64(1); seed <= seeds; seed++ {
+				c, err := RandomRun(tc.nodes, seed, 2000)
+				if err != nil {
+					t.Fatal(err)
+				}
+				committed := false
+				for _, r := range c.Records() {
+					events[r.Event]++
+					committed = committed || r.Event == tracelog.EvAdvanceCommit
+				}
+				if committed {
+					committing++
+				}
+			}
+			t.Logf("%d of %d seeds commit; advance_commit %d, truncate_log %d",
+				committing, seeds, events[tracelog.EvAdvanceCommit], events[tracelog.EvTruncateLog])
+			if committing < tc.minCommitting {
+				t.Errorf("only %d of %d seeds commit anything, want at least %d", committing, seeds, tc.minCommitting)
+			}
+			for _, ev := range []string{tracelog.EvAdvanceCommit, tracelog.EvTruncateLog} {
+				if events[ev] == 0 {
+					t.Errorf("no %s record in any seed", ev)
+				}
+			}
+		})
 	}
 }

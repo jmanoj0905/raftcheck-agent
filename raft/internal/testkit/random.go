@@ -22,15 +22,21 @@ const (
 	actRestart
 )
 
-// actionWeights are the §8.2 weights doubled, so crash and restart (2.5)
-// are whole numbers.
+// actionWeights are the action weights doubled, so crash and restart (2.5)
+// are whole numbers. Weights (out of 100): deliver 58, heartbeat 15,
+// timeout 2, propose 10, drop 5, duplicate 5, crash 2.5, restart 2.5.
+//
+// The plan had timeout 10 and deliver 50. At that rate a timeout knocked
+// the leader out before it could replicate, and 92 of 100 five-node seeds
+// never committed anything. The user decided on 2026-11-11 to lower timeout
+// to 2 and give the spare 8 to deliver. TestWalkCoverage guards this.
 var actionWeights = []struct {
 	kind   actionKind
 	weight int
 }{
-	{actDeliver, 100},
+	{actDeliver, 116},
 	{actHeartbeat, 30},
-	{actTimeout, 20},
+	{actTimeout, 4},
 	{actPropose, 20},
 	{actDrop, 10},
 	{actDuplicate, 10},
