@@ -251,6 +251,7 @@ func TestUnreliableAgree3C(t *testing.T) {
 	c := newCluster(t, n, false)
 
 	var wg sync.WaitGroup
+	t.Cleanup(wg.Wait) // runs before the cluster's cleanup (LIFO)
 	errs := make(chan error, 49*4)
 	for iter := 1; iter < 50; iter++ {
 		for j := range 4 {
@@ -292,6 +293,7 @@ func churn(t *testing.T, reliable bool) {
 	rng := rand.New(rand.NewPCG(c.seed, 9))
 
 	var stop atomic.Bool
+	defer stop.Store(true)
 	type result struct {
 		seen []string // commands this client saw committed
 		err  error

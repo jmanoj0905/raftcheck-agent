@@ -290,9 +290,9 @@ func TestBackup3B(t *testing.T) {
 // TestCount3B checks the cluster sends no more RPCs than it needs. The
 // budgets are MIT's, and MIT counts RPCs: a request and its reply are one.
 // So they are checked against rpcCount (requests only), which equals MIT's
-// RPC count; the counts with replies are logged too. Each Start sends an AppendEntries to each
-// follower at once, so the 12 Starts below alone cost 24 requests, or 48
-// messages with the replies, which is over the 42 budget.
+// RPC count; the counts with replies are logged too. Each Start sends an
+// AppendEntries to each follower at once, so the 12 Starts below alone cost
+// 24 requests, or 48 messages with the replies, which is over the 42 budget.
 func TestCount3B(t *testing.T) {
 	const n = 3
 	c := newCluster(t, n, true)

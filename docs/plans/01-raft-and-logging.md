@@ -472,14 +472,16 @@ The four invariants (§8.2):
 
 | Action | Weight |
 |---|---|
-| deliver | 50 |
+| deliver | 58 |
 | heartbeat (on a random leader, if any) | 15 |
-| timeout | 10 |
+| timeout | 2 |
 | propose (`"c<k>"`, k increasing, to a random node) | 10 |
 | drop | 5 |
 | duplicate | 5 |
 | crash (only if fewer than n nodes are down) | 2.5 |
 | restart (only if any node is down) | 2.5 |
+
+(Changed 2026-11-11 by user decision: at timeout 10 most 5-node seeds never committed, so timeout is 2 and deliver is 58. `TestWalkCoverage` guards this.)
 
 If more than 200 messages are in flight, use only deliver and drop. Actions that aren't possible in the current state are skipped and re-drawn.
 
@@ -629,7 +631,7 @@ Own implementations; the assertions match MIT's well-known checks.
   - `TestPersist23C`: 5 nodes, 5 rounds of crash/disconnect/restart patterns.
   - `TestPersist33C`: the leader takes an entry, crashes before commit, and restarts → the entry eventually commits or is overwritten consistently.
   - `TestFigure83C`: 1000 iterations of random leader crashes and restarts on 5 nodes, `one(…, 1, true)` each round, then all nodes up → one final commit on all.
-  - `TestFigure8Unreliable3C`: the same with an unreliable network. Under `testing.Short()`, run 200 iterations.
+  - `TestFigure8Unreliable3C`: the same with an unreliable network. It runs 50 rounds (30 under `testing.Short()`) (user decision 2026-11-11: D5 step-back-by-one makes catch-up linear in lag).
   - `TestUnreliableAgree3C`: 5 nodes, 50 concurrent `one` calls on an unreliable network.
   - `TestReliableChurn3C` and `TestUnreliableChurn3C`: 5 nodes, 5 s of random crash, restart and disconnect while clients `Start`. After healing, everything that was committed is applied identically everywhere.
 

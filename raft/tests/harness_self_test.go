@@ -141,6 +141,12 @@ func TestCheckSink(t *testing.T) {
 		case tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)):
 			t.Errorf("%s: error %v, want one containing %q", tc.name, err, tc.wantErr)
 		}
+		if tc.name == "valid" {
+			// an in-place append(log[:2], ...) would overwrite entry 2
+			if got := s.Records()[0].State.Log[2]; got != (tracelog.LogPair{Term: 1, Command: "2"}) {
+				t.Errorf("checkSink changed stored entry 2: %v", got)
+			}
+		}
 		if got := len(s.Records()[0].State.Log); got != len(tc.recs[0].State.Log) {
 			t.Errorf("%s: checkSink changed the stored log (length %d, was %d)", tc.name, got, len(tc.recs[0].State.Log))
 		}
