@@ -1,0 +1,20 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: raft
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: raft/go.mod
+          cache-dependency-path: raft/go.sum
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go install honnef.co/go/tools/cmd/staticcheck@latest && staticcheck ./...
+      - run: go test -race -short ./...

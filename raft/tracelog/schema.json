@@ -1,0 +1,804 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/jmanoj0905/raftcheck-agent/raft/tracelog/schema.json",
+  "title": "raftcheck log record",
+  "type": "object",
+  "required": [
+    "v",
+    "node",
+    "seq",
+    "event",
+    "term",
+    "details",
+    "state"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "v": {
+      "const": 1
+    },
+    "node": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "event": {
+      "enum": [
+        "update_term",
+        "become_follower",
+        "become_candidate",
+        "become_leader",
+        "send_request_vote",
+        "recv_request_vote",
+        "recv_vote_reply",
+        "send_append_entries",
+        "recv_append_entries",
+        "recv_append_reply",
+        "append_entry",
+        "truncate_log",
+        "advance_commit",
+        "apply_entry",
+        "persist",
+        "restart",
+        "propose_rejected",
+        "crash"
+      ]
+    },
+    "term": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "details": {
+      "type": "object"
+    },
+    "state": {
+      "type": "object",
+      "required": [
+        "role",
+        "current_term",
+        "voted_for",
+        "log",
+        "commit_index",
+        "last_applied",
+        "leader_id"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "role": {
+          "enum": [
+            "follower",
+            "candidate",
+            "leader"
+          ]
+        },
+        "current_term": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "voted_for": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "log": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "prefixItems": [
+              {
+                "type": "integer",
+                "minimum": 1
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "minItems": 2,
+            "maxItems": 2,
+            "items": false
+          }
+        },
+        "commit_index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "last_applied": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "leader_id": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "next_index": {
+          "type": "object",
+          "propertyNames": {
+            "pattern": "^[1-9][0-9]*$"
+          },
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "match_index": {
+          "type": "object",
+          "propertyNames": {
+            "pattern": "^[1-9][0-9]*$"
+          },
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      }
+    },
+    "step": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "cause": {
+      "type": "string"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "update_term"
+          }
+        },
+        "required": [
+          "event"
+        ]
+      },
+      "then": {
+        "properties": {
+          "details": {
+            "type": "object",
+            "required": [
+              "old_term",
+              "from"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "old_term": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "from": {
+                "type": "integer",
+                "minimum": 1
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "become_follower"
+          }
+        },
+        "required": [
+          "event"
+        ]
+      },
+      "then": {
+        "properties": {
+          "details": {
+            "type": "object",
+            "required": [
+              "old_role"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "old_role": {
+                "enum": [
+                  "follower",
+                  "candidate",
+                  "leader"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "become_candidate"
+          }
+        },
+        "required": [
+          "event"
+        ]
+      },
+      "then": {
+        "properties": {
+          "details": {
+            "type": "object",
+            "required": [
+              "old_role"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "old_role": {
+                "enum": [
+                  "follower",
+                  "candidate",
+                  "leader"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "become_leader"
+          }
+        },
+        "required": [
+          "event"
+        ]
+      },
+      "then": {
+        "properties": {
+          "details": {
+            "type": "object",
+            "required": [
+              "votes"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "votes": {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "send_request_vote"
+          }
+        },
+        "required": [
+          "event"
+        ]
+      },
+      "then": {
+        "properties": {
+          "details": {
+            "type": "object",
+            "required": [
+              "to",
+              "msg_id",
+              "last_log_index",
+              "last_log_term"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "to": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "msg_id": {
+                "type": "string",
+                "pattern": "^[1-9][0-9]*-[1-9][0-9]*$"
+              },
+              "last_log_index": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "last_log_term": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "recv_request_vote"
+          }
+        },
+        "required": [
+          "event"
+        ]
+      },
+      "then": {
+        "properties": {
+          "details": {
+            "type": "object",
+            "required": [
+              "from",
+              "msg_id",
+              "granted",
+              "reason"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "from": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "msg_id": {
+                "type": "string",
+                "pattern": "^[1-9][0-9]*-[1-9][0-9]*$"
+              },
+              "granted": {
+                "type": "boolean"
+              },
+              "reason": {
+                "enum": [
+                  "ok",
+                  "stale_term",
+                  "already_voted",
+                  "log_not_up_to_date"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "recv_vote_reply"
+          }
+        },
+        "required": [
+          "event"
+        ]
+      },
+      "then": {
+        "properties": {
+          "details": {
+            "type": "object",
+            "required": [
+              "from",
+              "msg_id",
+              "granted"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "from": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "msg_id": {
+                "type": "string",
+                "pattern": "^[1-9][0-9]*-[1-9][0-9]*$"
+              },
+              "granted": {
+                "type": "boolean"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "send_append_entries"
+          }
+        },
+        "required": [
+          "event"
+        ]
+      },
+      "then": {
+        "properties": {
+          "details": {
+            "type": "object",
+            "required": [
+              "to",
+              "msg_id",
+              "prev_log_index",
+              "prev_log_term",
+              "n_entries",
+              "leader_commit"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "to": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "msg_id": {
+                "type": "string",
+                "pattern": "^[1-9][0-9]*-[1-9][0-9]*$"
+              },
+              "prev_log_index": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "prev_log_term": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "n_entries": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "leader_commit": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "recv_append_entries"
+          }
+        },
+        "required": [
+          "event"
+        ]
+      },
+      "then": {
+        "properties": {
+          "details": {
+            "type": "object",
+            "required": [
+              "from",
+              "msg_id",
+              "success",
+              "reason"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "from": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "msg_id": {
+                "type": "string",
+                "pattern": "^[1-9][0-9]*-[1-9][0-9]*$"
+              },
+              "success": {
+                "type": "boolean"
+              },
+              "reason": {
+                "enum": [
+                  "ok",
+                  "stale_term",
+                  "log_mismatch"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "recv_append_reply"
+          }
+        },
+        "required": [
+          "event"
+        ]
+      },
+      "then": {
+        "properties": {
+          "details": {
+            "type": "object",
+            "required": [
+              "from",
+              "msg_id",
+              "success",
+              "match_index"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "from": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "msg_id": {
+                "type": "string",
+                "pattern": "^[1-9][0-9]*-[1-9][0-9]*$"
+              },
+              "success": {
+                "type": "boolean"
+              },
+              "match_index": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "append_entry"
+          }
+        },
+        "required": [
+          "event"
+        ]
+      },
+      "then": {
+        "properties": {
+          "details": {
+            "type": "object",
+            "required": [
+              "index",
+              "entry_term",
+              "command"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "index": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "entry_term": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "command": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "truncate_log"
+          }
+        },
+        "required": [
+          "event"
+        ]
+      },
+      "then": {
+        "properties": {
+          "details": {
+            "type": "object",
+            "required": [
+              "from_index",
+              "removed"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "from_index": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "removed": {
+                "type": "integer",
+                "minimum": 1
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "advance_commit"
+          }
+        },
+        "required": [
+          "event"
+        ]
+      },
+      "then": {
+        "properties": {
+          "details": {
+            "type": "object",
+            "required": [
+              "old",
+              "new"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "old": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "new": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "apply_entry"
+          }
+        },
+        "required": [
+          "event"
+        ]
+      },
+      "then": {
+        "properties": {
+          "details": {
+            "type": "object",
+            "required": [
+              "index",
+              "entry_term",
+              "command"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "index": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "entry_term": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "command": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "persist"
+          }
+        },
+        "required": [
+          "event"
+        ]
+      },
+      "then": {
+        "properties": {
+          "details": {
+            "type": "object",
+            "required": [
+              "log_len"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "log_len": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "restart"
+          }
+        },
+        "required": [
+          "event"
+        ]
+      },
+      "then": {
+        "properties": {
+          "details": {
+            "type": "object",
+            "required": [
+              "restored_term",
+              "restored_log_len"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "restored_term": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "restored_log_len": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "propose_rejected"
+          }
+        },
+        "required": [
+          "event"
+        ]
+      },
+      "then": {
+        "properties": {
+          "details": {
+            "type": "object",
+            "required": [
+              "command"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "command": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "crash"
+          }
+        },
+        "required": [
+          "event"
+        ]
+      },
+      "then": {
+        "properties": {
+          "details": {
+            "type": "object",
+            "maxProperties": 0
+          }
+        }
+      }
+    }
+  ]
+}
