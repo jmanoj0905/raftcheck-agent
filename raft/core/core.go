@@ -48,6 +48,25 @@ func New(id int, peers []int) *Node {
 	return &Node{id: id, peers: checkPeers(id, peers)}
 }
 
+// Restore rebuilds a node after a restart. It copies ps (the node never
+// aliases the caller's log), validates peers like New, resets all volatile
+// state, and continues the counters from c. The Output holds exactly one
+// restart record: no persist, no messages.
+func Restore(id int, peers []int, ps PersistentState, c Counters) (*Node, Output) {
+	n := &Node{
+		id:          id,
+		peers:       checkPeers(id, peers),
+		currentTerm: ps.CurrentTerm,
+		votedFor:    ps.VotedFor,
+		log:         slices.Clone(ps.Log),
+		counters:    c,
+	}
+	n.record(tracelog.EvRestart, map[string]any{
+		"restored_term": n.currentTerm, "restored_log_len": len(n.log),
+	})
+	return n, n.finish()
+}
+
 func checkPeers(id int, peers []int) []int {
 	ps := slices.Clone(peers)
 	slices.Sort(ps)
