@@ -309,7 +309,7 @@ func TestReorderedShortAppendKeepsLaterEntries(t *testing.T) {
 
 func TestLogMismatchRejected(t *testing.T) {
 	cases := []struct {
-		name               string
+		name                string
 		prevIndex, prevTerm int
 	}{
 		{"prev beyond end", 5, 1},
