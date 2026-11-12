@@ -238,6 +238,46 @@ func (c *Cluster) applyOutput(id int, action string, out core.Output) error {
 	if !reflect.DeepEqual(out.Apply, fromRecs) {
 		return c.fail(fmt.Errorf("node %d: Output.Apply %v does not match apply_entry records %v", id, out.Apply, fromRecs))
 	}
+	if err := checkReplyLinks(out); err != nil {
+		return c.fail(fmt.Errorf("node %d: %w", id, err))
+	}
+	return nil
+}
+
+// checkReplyLinks checks that the step's replies and its recv_request_vote /
+// recv_append_entries records pair up one to one: each record's
+// reply_msg_id is the MsgID of a reply in Messages of the matching type,
+// sent back to the record's "from".
+func checkReplyLinks(out core.Output) error {
+	replies := map[string]core.Message{}
+	for _, m := range out.Messages {
+		if m.Type == core.MsgRequestVoteReply || m.Type == core.MsgAppendEntriesReply {
+			replies[m.MsgID] = m
+		}
+	}
+	linked := 0
+	for _, r := range out.Records {
+		var want core.MsgType
+		switch r.Event {
+		case tracelog.EvRecvRequestVote:
+			want = core.MsgRequestVoteReply
+		case tracelog.EvRecvAppendEntries:
+			want = core.MsgAppendEntriesReply
+		default:
+			continue
+		}
+		id, _ := r.Details["reply_msg_id"].(string)
+		m, ok := replies[id]
+		from, _ := intDetail(r, "from")
+		if !ok || m.Type != want || m.To != from {
+			return fmt.Errorf("seq %d %s has reply_msg_id %q, which is not a reply of type %d to node %d in this step's messages",
+				r.Seq, r.Event, id, want, from)
+		}
+		linked++
+	}
+	if linked != len(replies) {
+		return fmt.Errorf("%d replies sent but %d recv records link to one", len(replies), linked)
+	}
 	return nil
 }
 

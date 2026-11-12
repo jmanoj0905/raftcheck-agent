@@ -118,7 +118,7 @@ func (n *Node) replyAppend(m Message, reason string, matchIndex int) {
 	n.record(tracelog.EvRecvAppendEntries, map[string]any{
 		"from": m.From, "msg_id": m.MsgID, "success": success, "reason": reason,
 	})
-	n.send(Message{
+	n.sendReply(Message{
 		Type: MsgAppendEntriesReply, To: m.From, Term: n.currentTerm,
 		Success: success, MatchIndex: matchIndex, ReqPrevLogIndex: m.PrevLogIndex,
 	})

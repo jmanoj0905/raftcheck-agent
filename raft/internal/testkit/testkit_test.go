@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jmanoj0905/raftcheck-agent/raft/core"
 	"github.com/jmanoj0905/raftcheck-agent/raft/internal/schemacheck"
 	"github.com/jmanoj0905/raftcheck-agent/raft/tracelog"
 )
@@ -438,4 +439,19 @@ func TestWalkCoverage(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestReplyLinksCheck(t *testing.T) {
+	recv := rec(1, tracelog.EvRecvRequestVote, 1, map[string]any{"from": 2, "reply_msg_id": "1-4"})
+	reply := core.Message{Type: core.MsgRequestVoteReply, From: 1, To: 2, MsgID: "1-4"}
+	if err := checkReplyLinks(core.Output{Records: []tracelog.Record{recv}, Messages: []core.Message{reply}}); err != nil {
+		t.Fatalf("linked reply: %v", err)
+	}
+	wrongID := reply
+	wrongID.MsgID = "1-5"
+	wantErr(t, checkReplyLinks(core.Output{Records: []tracelog.Record{recv}, Messages: []core.Message{wrongID}}), "reply_msg_id")
+	wrongType := reply
+	wrongType.Type = core.MsgAppendEntriesReply
+	wantErr(t, checkReplyLinks(core.Output{Records: []tracelog.Record{recv}, Messages: []core.Message{wrongType}}), "reply_msg_id")
+	wantErr(t, checkReplyLinks(core.Output{Messages: []core.Message{reply}}), "1 replies sent but 0")
 }

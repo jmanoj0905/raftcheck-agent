@@ -336,7 +336,8 @@
               "from",
               "msg_id",
               "granted",
-              "reason"
+              "reason",
+              "reply_msg_id"
             ],
             "additionalProperties": false,
             "properties": {
@@ -358,6 +359,10 @@
                   "already_voted",
                   "log_not_up_to_date"
                 ]
+              },
+              "reply_msg_id": {
+                "type": "string",
+                "pattern": "^[1-9][0-9]*-[1-9][0-9]*$"
               }
             }
           }
@@ -475,7 +480,8 @@
               "from",
               "msg_id",
               "success",
-              "reason"
+              "reason",
+              "reply_msg_id"
             ],
             "additionalProperties": false,
             "properties": {
@@ -496,6 +502,10 @@
                   "stale_term",
                   "log_mismatch"
                 ]
+              },
+              "reply_msg_id": {
+                "type": "string",
+                "pattern": "^[1-9][0-9]*-[1-9][0-9]*$"
               }
             }
           }

@@ -30,7 +30,7 @@ The order matters: a node must save before it sends, or a crash could make it fo
 One JSON object per line. The fields, the 18 event names and the rules are in [`tracelog/schema.json`](tracelog/schema.json), which is the single source of truth (Go and Python both use it). Some details that are easy to miss:
 
 - **Records come after their own change.** Inside one step, a follower records `advance_commit` before `recv_append_entries`, and a leader records `recv_append_reply` before `advance_commit`. Each record is written after the change it describes.
-- **Reply messages get a message id (`MsgID`) but no `send_*` record.** Only `RequestVote` and `AppendEntries` requests get `send_request_vote` and `send_append_entries`.
+- **Reply messages get a message id (`MsgID`) but no `send_*` record.** Only `RequestVote` and `AppendEntries` requests get `send_request_vote` and `send_append_entries`. A reply is linked through the record of the request it answers instead: every `recv_request_vote` and `recv_append_entries` sends exactly one reply (rejections too) and carries its id as `reply_msg_id`. So the leader's `recv_append_reply {msg_id: "2-9"}` matches the follower's `recv_append_entries {reply_msg_id: "2-9"}`.
 - **The counters are saved separately (decision D6).** `seq` (the record counter) and the message counter are not part of Raft's persistent state. `Restore` restores them whenever the counters are non-zero, even if there is no saved state, so a `seq` is never used twice.
 - **`FileSink` appends.** It opens the file for appending, so delete the file if you want a fresh run.
 

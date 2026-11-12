@@ -186,7 +186,8 @@ func TestDirtyOnlyWhenPersistentStateChanges(t *testing.T) {
 }
 
 // TestFinishOrder checks the persist -> send -> apply order, seq and MsgID
-// numbering, the deep-copied Persist, and that the records match the schema.
+// numbering (including the reply_msg_id patched into the recv_* record), the
+// deep-copied Persist, and that the records match the schema.
 func TestFinishOrder(t *testing.T) {
 	n := New(1, []int{1, 2, 3})
 	n.setTerm(2)
@@ -195,14 +196,15 @@ func TestFinishOrder(t *testing.T) {
 	n.record(tracelog.EvBecomeCandidate, map[string]any{"old_role": "follower"})
 	n.send(Message{Type: MsgAppendEntries, To: 3, Term: 2, Entries: n.entriesFrom(1), LeaderCommit: 1})
 	n.send(Message{Type: MsgRequestVote, To: 2, Term: 2, LastLogIndex: 1, LastLogTerm: 2})
-	n.send(Message{Type: MsgRequestVoteReply, To: 2, Term: 2, VoteGranted: true})
+	n.record(tracelog.EvRecvRequestVote, map[string]any{"from": 2, "msg_id": "2-5", "granted": true, "reason": "ok"})
+	n.sendReply(Message{Type: MsgRequestVoteReply, To: 2, Term: 2, VoteGranted: true})
 	n.commitIndex = 1
 	n.resetTimer = true
 
 	out := n.finish()
 
 	wantEvents := []string{
-		tracelog.EvBecomeCandidate, tracelog.EvPersist,
+		tracelog.EvBecomeCandidate, tracelog.EvRecvRequestVote, tracelog.EvPersist,
 		tracelog.EvSendRequestVote, tracelog.EvSendAppendEntries, tracelog.EvApplyEntry,
 	}
 	if got := recordEvents(out); !reflect.DeepEqual(got, wantEvents) {
@@ -213,7 +215,13 @@ func TestFinishOrder(t *testing.T) {
 			t.Errorf("record %d: seq %d node %d v %d term %d", i, r.Seq, r.Node, r.V, r.Term)
 		}
 	}
-	if d := out.Records[1].Details; !reflect.DeepEqual(d, map[string]any{"log_len": 1}) {
+	// The reply was queued last but sorts between the two requests, so it
+	// gets 1-2, and the recv record names that id.
+	wantRV := map[string]any{"from": 2, "msg_id": "2-5", "granted": true, "reason": "ok", "reply_msg_id": "1-2"}
+	if d := out.Records[1].Details; !reflect.DeepEqual(d, wantRV) {
+		t.Errorf("recv_request_vote details = %v, want %v", d, wantRV)
+	}
+	if d := out.Records[2].Details; !reflect.DeepEqual(d, map[string]any{"log_len": 1}) {
 		t.Errorf("persist details = %v", d)
 	}
 
@@ -232,11 +240,11 @@ func TestFinishOrder(t *testing.T) {
 			t.Errorf("message %d = %+v, want type %d to %d id %s from 1", i, m, w.typ, w.to, w.msgID)
 		}
 	}
-	rv := out.Records[2].Details
+	rv := out.Records[3].Details
 	if !reflect.DeepEqual(rv, map[string]any{"to": 2, "msg_id": "1-1", "last_log_index": 1, "last_log_term": 2}) {
 		t.Errorf("send_request_vote details = %v", rv)
 	}
-	ae := out.Records[3].Details
+	ae := out.Records[4].Details
 	wantAE := map[string]any{"to": 3, "msg_id": "1-3", "prev_log_index": 0, "prev_log_term": 0, "n_entries": 1, "leader_commit": 1}
 	if !reflect.DeepEqual(ae, wantAE) {
 		t.Errorf("send_append_entries details = %v", ae)
@@ -245,18 +253,18 @@ func TestFinishOrder(t *testing.T) {
 	if !reflect.DeepEqual(out.Apply, []Applied{{Index: 1, Term: 2, Command: "set x 1"}}) {
 		t.Errorf("Apply = %v", out.Apply)
 	}
-	ap := out.Records[4]
+	ap := out.Records[5]
 	if !reflect.DeepEqual(ap.Details, map[string]any{"index": 1, "entry_term": 2, "command": "set x 1"}) {
 		t.Errorf("apply_entry details = %v", ap.Details)
 	}
-	if ap.State.LastApplied != 1 || out.Records[3].State.LastApplied != 0 {
-		t.Errorf("apply record state LastApplied %d, send record %d", ap.State.LastApplied, out.Records[3].State.LastApplied)
+	if ap.State.LastApplied != 1 || out.Records[4].State.LastApplied != 0 {
+		t.Errorf("apply record state LastApplied %d, send record %d", ap.State.LastApplied, out.Records[4].State.LastApplied)
 	}
 	if !out.ResetElectionTimer {
 		t.Error("ResetElectionTimer lost")
 	}
-	if c := n.Counters(); c != (Counters{LastSeq: 5, LastMsg: 3}) {
-		t.Errorf("Counters = %+v, want {5 3}", c)
+	if c := n.Counters(); c != (Counters{LastSeq: 6, LastMsg: 3}) {
+		t.Errorf("Counters = %+v, want {6 3}", c)
 	}
 
 	want := PersistentState{CurrentTerm: 2, VotedFor: 1, Log: []Entry{{2, "set x 1"}}}
@@ -279,8 +287,8 @@ func TestFinishOrder(t *testing.T) {
 		t.Errorf("second finish = %+v, want empty", again)
 	}
 	n.send(Message{Type: MsgRequestVote, To: 3})
-	if out := n.finish(); out.Messages[0].MsgID != "1-4" || out.Records[0].Seq != 6 {
-		t.Errorf("next msg %s seq %d, want 1-4 and 6", out.Messages[0].MsgID, out.Records[0].Seq)
+	if out := n.finish(); out.Messages[0].MsgID != "1-4" || out.Records[0].Seq != 7 {
+		t.Errorf("next msg %s seq %d, want 1-4 and 7", out.Messages[0].MsgID, out.Records[0].Seq)
 	}
 }
 

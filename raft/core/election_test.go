@@ -204,7 +204,7 @@ func TestC2VoteOncePerTerm(t *testing.T) {
 	if d := detailsOf(t, out, tracelog.EvUpdateTerm); !reflect.DeepEqual(d, map[string]any{"old_term": 0, "from": 2}) {
 		t.Errorf("update_term details = %v", d)
 	}
-	wantRV := map[string]any{"from": 2, "msg_id": "2-1", "granted": true, "reason": "ok"}
+	wantRV := map[string]any{"from": 2, "msg_id": "2-1", "granted": true, "reason": "ok", "reply_msg_id": "1-1"}
 	if d := detailsOf(t, out, tracelog.EvRecvRequestVote); !reflect.DeepEqual(d, wantRV) {
 		t.Errorf("recv_request_vote details = %v, want %v", d, wantRV)
 	}
@@ -214,7 +214,7 @@ func TestC2VoteOncePerTerm(t *testing.T) {
 	if out.ResetElectionTimer || out.Persist != nil {
 		t.Errorf("refused vote: reset %v Persist %v, want false and nil", out.ResetElectionTimer, out.Persist)
 	}
-	wantRV = map[string]any{"from": 3, "msg_id": "3-1", "granted": false, "reason": "already_voted"}
+	wantRV = map[string]any{"from": 3, "msg_id": "3-1", "granted": false, "reason": "already_voted", "reply_msg_id": "1-2"}
 	if d := detailsOf(t, out, tracelog.EvRecvRequestVote); !reflect.DeepEqual(d, wantRV) {
 		t.Errorf("recv_request_vote details = %v, want %v", d, wantRV)
 	}
@@ -290,7 +290,7 @@ func TestStaleRequestVoteRejected(t *testing.T) {
 	if got := recordEvents(out); !reflect.DeepEqual(got, []string{tracelog.EvRecvRequestVote}) {
 		t.Errorf("events = %v, want [recv_request_vote]", got)
 	}
-	want := map[string]any{"from": 2, "msg_id": "2-1", "granted": false, "reason": "stale_term"}
+	want := map[string]any{"from": 2, "msg_id": "2-1", "granted": false, "reason": "stale_term", "reply_msg_id": "1-1"}
 	if d := detailsOf(t, out, tracelog.EvRecvRequestVote); !reflect.DeepEqual(d, want) {
 		t.Errorf("details = %v, want %v", d, want)
 	}

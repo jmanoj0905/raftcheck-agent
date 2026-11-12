@@ -222,7 +222,7 @@ func TestAppendEntriesOnEmptyFollower(t *testing.T) {
 	if d := out.Records[2].Details; !reflect.DeepEqual(d, map[string]any{"index": 2, "entry_term": 1, "command": "b"}) {
 		t.Errorf("append_entry details = %v", d)
 	}
-	want := map[string]any{"from": 1, "msg_id": "1-3", "success": true, "reason": "ok"}
+	want := map[string]any{"from": 1, "msg_id": "1-3", "success": true, "reason": "ok", "reply_msg_id": "2-1"}
 	if d := out.Records[3].Details; !reflect.DeepEqual(d, want) {
 		t.Errorf("recv_append_entries details = %v, want %v", d, want)
 	}
@@ -319,7 +319,7 @@ func TestLogMismatchRejected(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			n := followerWith(2, 2, Entry{1, "a"}, Entry{1, "b"})
 			out := step(t, n, appendEntries(1, 2, 2, c.prevIndex, c.prevTerm, []Entry{{2, "x"}}, 2, "1-7"))
-			want := map[string]any{"from": 1, "msg_id": "1-7", "success": false, "reason": "log_mismatch"}
+			want := map[string]any{"from": 1, "msg_id": "1-7", "success": false, "reason": "log_mismatch", "reply_msg_id": "2-1"}
 			if d := detailsOf(t, out, tracelog.EvRecvAppendEntries); !reflect.DeepEqual(d, want) {
 				t.Errorf("details = %v, want %v", d, want)
 			}
@@ -341,7 +341,7 @@ func TestStaleAppendEntriesRejected(t *testing.T) {
 	n := followerWith(2, 3, Entry{1, "a"})
 	n.leaderID = 3
 	out := step(t, n, appendEntries(1, 2, 2, 1, 1, []Entry{{2, "x"}}, 1, "1-9"))
-	want := map[string]any{"from": 1, "msg_id": "1-9", "success": false, "reason": "stale_term"}
+	want := map[string]any{"from": 1, "msg_id": "1-9", "success": false, "reason": "stale_term", "reply_msg_id": "2-1"}
 	if d := detailsOf(t, out, tracelog.EvRecvAppendEntries); !reflect.DeepEqual(d, want) {
 		t.Errorf("details = %v, want %v", d, want)
 	}
@@ -771,4 +771,83 @@ func TestLeaderStepsDownOnSameTermAppend(t *testing.T) {
 	if st := n.State(); st.Role != "follower" || st.LeaderID != 2 || st.CurrentTerm != 1 {
 		t.Errorf("state = %+v, want follower term 1 leader 2", st)
 	}
+}
+
+// TestReplyMsgIDMatchesReply checks that every recv_request_vote and
+// recv_append_entries names, as reply_msg_id, the MsgID of the one reply
+// its step sends, for every outcome including the rejections.
+func TestReplyMsgIDMatchesReply(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup func(t *testing.T) *Node
+		ev    Event
+		event string
+		typ   MsgType
+	}{
+		{"vote ok", func(t *testing.T) *Node { return followerWith(1, 1) },
+			requestVote(2, 1, 2, 0, 0, "2-4"), tracelog.EvRecvRequestVote, MsgRequestVoteReply},
+		{"vote stale_term", func(t *testing.T) *Node { return followerWith(1, 3) },
+			requestVote(2, 1, 2, 0, 0, "2-4"), tracelog.EvRecvRequestVote, MsgRequestVoteReply},
+		{"vote already_voted", func(t *testing.T) *Node {
+			n := New(1, []int{1, 2, 3})
+			step(t, n, ElectionTimeout{})
+			return n
+		}, requestVote(2, 1, 1, 0, 0, "2-4"), tracelog.EvRecvRequestVote, MsgRequestVoteReply},
+		{"vote log_not_up_to_date", func(t *testing.T) *Node { return followerWith(1, 2, Entry{2, "a"}) },
+			requestVote(2, 1, 2, 0, 0, "2-4"), tracelog.EvRecvRequestVote, MsgRequestVoteReply},
+		{"append ok", func(t *testing.T) *Node { return followerWith(1, 1) },
+			appendEntries(2, 1, 1, 0, 0, []Entry{{1, "a"}}, 0, "2-4"), tracelog.EvRecvAppendEntries, MsgAppendEntriesReply},
+		{"append stale_term", func(t *testing.T) *Node { return followerWith(1, 3) },
+			appendEntries(2, 1, 2, 0, 0, nil, 0, "2-4"), tracelog.EvRecvAppendEntries, MsgAppendEntriesReply},
+		{"append log_mismatch", func(t *testing.T) *Node { return followerWith(1, 1) },
+			appendEntries(2, 1, 1, 5, 1, nil, 0, "2-4"), tracelog.EvRecvAppendEntries, MsgAppendEntriesReply},
+		{"append steps a leader down", func(t *testing.T) *Node { return leaderOfTerm(t, 1) },
+			appendEntries(2, 1, 2, 0, 0, nil, 0, "2-4"), tracelog.EvRecvAppendEntries, MsgAppendEntriesReply},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			n := c.setup(t)
+			// Spend some message ids first, so the reply's id is not "1-1".
+			n.counters.LastMsg += 6
+			out := step(t, n, c.ev)
+			if len(out.Messages) != 1 || out.Messages[0].Type != c.typ || out.Messages[0].To != 2 {
+				t.Fatalf("messages = %+v, want one reply of type %d to 2", out.Messages, c.typ)
+			}
+			reply := out.Messages[0]
+			d := detailsOf(t, out, c.event)
+			if d["reply_msg_id"] != reply.MsgID {
+				t.Errorf("reply_msg_id = %v, but the reply carries %s", d["reply_msg_id"], reply.MsgID)
+			}
+			if reply.MsgID == "1-1" {
+				t.Errorf("reply id %s did not continue the counter", reply.MsgID)
+			}
+			for _, r := range out.Records {
+				if _, ok := r.Details["reply_msg_id"]; ok && r.Event != c.event {
+					t.Errorf("%s record has reply_msg_id", r.Event)
+				}
+			}
+		})
+	}
+}
+
+func TestReplyMustFollowItsRecvRecord(t *testing.T) {
+	reply := Message{Type: MsgRequestVoteReply, To: 2, Term: 1}
+	mustPanic(t, "reply through send", func() { New(1, []int{1, 2, 3}).send(reply) })
+	mustPanic(t, "reply with no record", func() { New(1, []int{1, 2, 3}).sendReply(reply) })
+	mustPanic(t, "reply after another record", func() {
+		n := New(1, []int{1, 2, 3})
+		n.record(tracelog.EvPersist, map[string]any{"log_len": 0})
+		n.sendReply(reply)
+	})
+	mustPanic(t, "two replies for one record", func() {
+		n := New(1, []int{1, 2, 3})
+		n.record(tracelog.EvRecvRequestVote, map[string]any{"from": 2, "msg_id": "2-1", "granted": false, "reason": "stale_term"})
+		n.sendReply(reply)
+		n.sendReply(reply)
+	})
+	mustPanic(t, "request through sendReply", func() {
+		n := New(1, []int{1, 2, 3})
+		n.record(tracelog.EvRecvRequestVote, map[string]any{})
+		n.sendReply(Message{Type: MsgAppendEntries, To: 2})
+	})
 }

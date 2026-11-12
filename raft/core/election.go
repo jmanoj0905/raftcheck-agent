@@ -110,7 +110,7 @@ func (n *Node) handleRequestVote(m Message) {
 	n.record(tracelog.EvRecvRequestVote, map[string]any{
 		"from": m.From, "msg_id": m.MsgID, "granted": granted, "reason": reason,
 	})
-	n.send(Message{Type: MsgRequestVoteReply, To: m.From, Term: n.currentTerm, VoteGranted: granted})
+	n.sendReply(Message{Type: MsgRequestVoteReply, To: m.From, Term: n.currentTerm, VoteGranted: granted})
 }
 
 // candidateLogUpToDate reports whether a log ending at (lastTerm, lastIndex)

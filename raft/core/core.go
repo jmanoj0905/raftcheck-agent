@@ -37,6 +37,7 @@ type Node struct {
 	dirty      bool // a persistent field changed this step
 	records    []tracelog.Record
 	outbox     []Message
+	replies    []pendingReply // replies whose recv_* record needs reply_msg_id
 	resetTimer bool           // becomes Output.ResetElectionTimer
 	proposed   *ProposeResult // becomes Output.Proposed
 }
@@ -198,19 +199,53 @@ func (n *Node) truncateFrom(i int) {
 	n.dirty = true
 }
 
-// send queues m. It sets m.From to this node; finish assigns MsgID. The
-// caller fills in everything else, including Term.
+// pendingReply ties a queued reply (its position in the outbox) to the
+// details of the recv_* record that answered the request, so finish can
+// write the reply's MsgID into that record as reply_msg_id.
+type pendingReply struct {
+	details map[string]any
+	msg     int
+}
+
+// send queues a request (RequestVote or AppendEntries). It sets m.From to
+// this node; finish assigns MsgID. The caller fills in everything else,
+// including Term. Replies must go through sendReply.
 func (n *Node) send(m Message) {
+	if m.Type == MsgRequestVoteReply || m.Type == MsgAppendEntriesReply {
+		panic(fmt.Sprintf("core: node %d queued a reply with send, not sendReply", n.id))
+	}
 	m.From = n.id
+	n.outbox = append(n.outbox, m)
+}
+
+// sendReply queues a reply like send and links it to the record written just
+// before it, which must be the recv_request_vote or recv_append_entries of
+// the request being answered: finish sets that record's reply_msg_id to the
+// MsgID the reply gets.
+func (n *Node) sendReply(m Message) {
+	if m.Type != MsgRequestVoteReply && m.Type != MsgAppendEntriesReply {
+		panic(fmt.Sprintf("core: node %d queued a request with sendReply", n.id))
+	}
+	last := len(n.records) - 1
+	if last < 0 || (n.records[last].Event != tracelog.EvRecvRequestVote && n.records[last].Event != tracelog.EvRecvAppendEntries) {
+		panic(fmt.Sprintf("core: node %d sent a reply without a recv_* record just before it", n.id))
+	}
+	if _, dup := n.records[last].Details["reply_msg_id"]; dup {
+		panic(fmt.Sprintf("core: node %d sent two replies for one recv_* record", n.id))
+	}
+	n.records[last].Details["reply_msg_id"] = "" // filled in by finish
+	m.From = n.id
+	n.replies = append(n.replies, pendingReply{details: n.records[last].Details, msg: len(n.outbox)})
 	n.outbox = append(n.outbox, m)
 }
 
 // finish turns the step's scratch state into an Output, in this order:
 //  1. If a persistent field changed: Persist (a deep copy) and a persist
 //     record {log_len}.
-//  2. Queued messages, stable-sorted by To, each given the next MsgID. Each
-//     RequestVote / AppendEntries gets a send_* record; replies get none,
-//     since spec §6.3 has no event for them.
+//  2. Queued messages, stable-sorted by To, each given the next MsgID in
+//     that sorted order. Each RequestVote / AppendEntries gets a send_*
+//     record; a reply gets none, but its MsgID is written as reply_msg_id
+//     into the recv_* record that sendReply linked it to.
 //  3. While commitIndex > lastApplied: lastApplied++, an Applied entry and
 //     an apply_entry record.
 //
@@ -229,9 +264,16 @@ func (n *Node) finish() Output {
 		n.record(tracelog.EvPersist, map[string]any{"log_len": len(n.log)})
 	}
 
-	slices.SortStableFunc(n.outbox, func(a, b Message) int { return a.To - b.To })
-	for i := range n.outbox {
-		m := &n.outbox[i]
+	// Sort queue positions rather than the messages, so each pending reply
+	// can find the id its message got.
+	order := make([]int, len(n.outbox))
+	for i := range order {
+		order[i] = i
+	}
+	slices.SortStableFunc(order, func(a, b int) int { return n.outbox[a].To - n.outbox[b].To })
+	ids := make([]string, len(n.outbox)) // by queue position
+	for _, q := range order {
+		m := n.outbox[q]
 		n.counters.LastMsg++
 		m.MsgID = strconv.Itoa(n.id) + "-" + strconv.FormatInt(n.counters.LastMsg, 10)
 		switch m.Type {
@@ -247,8 +289,12 @@ func (n *Node) finish() Output {
 				"n_entries": len(m.Entries), "leader_commit": m.LeaderCommit,
 			})
 		}
+		ids[q] = m.MsgID
+		out.Messages = append(out.Messages, m)
 	}
-	out.Messages = n.outbox
+	for _, p := range n.replies {
+		p.details["reply_msg_id"] = ids[p.msg]
+	}
 
 	for n.commitIndex > n.lastApplied {
 		n.lastApplied++
@@ -262,6 +308,6 @@ func (n *Node) finish() Output {
 	out.Records = n.records
 	out.ResetElectionTimer = n.resetTimer
 	out.Proposed = n.proposed
-	n.dirty, n.records, n.outbox, n.resetTimer, n.proposed = false, nil, nil, false, nil
+	n.dirty, n.records, n.outbox, n.replies, n.resetTimer, n.proposed = false, nil, nil, nil, false, nil
 	return out
 }
