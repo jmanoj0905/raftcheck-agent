@@ -1,0 +1,685 @@
+// Package tests holds the MIT-style scenario tests (spec §8.3): whole
+// clusters of wrapper nodes (package node) with real goroutines and timers,
+// on an in-memory network that can disconnect, drop and delay messages.
+//
+// The harness is our own; it follows the semantics of the MIT 6.5840 lab
+// tester (checkOneLeader, one, nCommitted, ...) but shares no code with it.
+// Scenario tests must not call t.Parallel: their timing assertions assume
+// they have the machine to themselves.
+package tests
+
+import (
+	"errors"
+	"fmt"
+	"math/rand/v2"
+	"runtime"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/jmanoj0905/raftcheck-agent/raft/core"
+	"github.com/jmanoj0905/raftcheck-agent/raft/internal/schemacheck"
+	"github.com/jmanoj0905/raftcheck-agent/raft/node"
+	"github.com/jmanoj0905/raftcheck-agent/raft/tracelog"
+)
+
+// electionTimeout is how long the tests allow for one election to finish.
+// It is well above node.DefaultConfig's 600 ms upper election timeout, as
+// in the MIT tester.
+const electionTimeout = time.Second
+
+// oneBudget is how long one() keeps trying to get a command committed.
+const oneBudget = 10 * time.Second
+
+// termMoved is what wait returns when some node's term passed startTerm
+// before the entry was committed (MIT's wait returns -1 for this). Test
+// commands are never this string.
+const termMoved = "<term moved on>"
+
+// applied is one committed entry as a node handed it to the application.
+type applied struct {
+	cmd  string
+	term int
+}
+
+// cluster is n wrapper nodes, ids 1..n, on one MemNetwork and one
+// MemPersister. Each node has its own MemorySink, kept across restarts so a
+// node's records form one sequence. Every incarnation of a node gets a fresh
+// applyCh and a reader goroutine that checks what it applies.
+type cluster struct {
+	t     *testing.T
+	n     int
+	ids   []int
+	seed  uint64
+	net   *countingNet
+	p     *node.MemPersister
+	sinks []*timedSink // index id-1
+	begin time.Time
+	goros int // goroutines running before the cluster started
+
+	mu        sync.Mutex
+	nodes     []*node.Node      // index id-1; nil while crashed
+	connected []bool            // index id-1; false while crashed
+	starts    []int             // incarnations started, per node; seeds the timers
+	readers   []reader          // index id-1; the current incarnation's reader
+	logs      []map[int]applied // index id-1; everything the node applied, across incarnations
+	agreed    map[int]applied   // index -> first entry any node applied there
+	applyErr  error             // first apply-check failure
+	nStarts   int               // Start calls that reached a leader, for the log line
+}
+
+// reader is the goroutine that drains one incarnation's applyCh.
+type reader struct {
+	stop chan struct{}
+	done chan struct{}
+}
+
+// newCluster starts n nodes and registers cleanup. With reliable false the
+// network drops 10% of messages and delays each by up to 27 ms (which also
+// reorders them).
+func newCluster(t *testing.T, n int, reliable bool) *cluster {
+	t.Helper()
+	ids := make([]int, n)
+	for i := range ids {
+		ids[i] = i + 1
+	}
+	seed := uint64(time.Now().UnixNano())
+	t.Logf("seed %d", seed)
+	c := &cluster{
+		t:         t,
+		n:         n,
+		ids:       ids,
+		seed:      seed,
+		net:       &countingNet{MemNetwork: node.NewMemNetwork(ids, seed)},
+		p:         node.NewMemPersister(),
+		sinks:     make([]*timedSink, n),
+		begin:     time.Now(),
+		goros:     runtime.NumGoroutine(),
+		nodes:     make([]*node.Node, n),
+		connected: make([]bool, n),
+		starts:    make([]int, n),
+		readers:   make([]reader, n),
+		logs:      make([]map[int]applied, n),
+		agreed:    map[int]applied{},
+	}
+	for i := range c.sinks {
+		c.sinks[i] = &timedSink{}
+		c.logs[i] = map[int]applied{}
+	}
+	t.Cleanup(c.cleanup)
+	c.setUnreliable(!reliable)
+	for _, id := range ids {
+		c.restart(id)
+	}
+	return c
+}
+
+// ---------------------------------------------------------------------------
+// Apply checking
+
+// setErr records err if it is the first apply-check failure.
+func (c *cluster) setErr(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.applyErr == nil {
+		c.applyErr = err
+	}
+}
+
+// checkApplyErr fails the test if any reader recorded an error.
+func (c *cluster) checkApplyErr() {
+	c.t.Helper()
+	if err := c.applyError(); err != nil {
+		c.t.Fatal(err)
+	}
+}
+
+// applyError returns the first error any reader recorded, or nil.
+func (c *cluster) applyError() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.applyErr != nil {
+		return fmt.Errorf("apply check: %w", c.applyErr)
+	}
+	return nil
+}
+
+// read drains applyCh for one incarnation of node id until stop is closed.
+// Within an incarnation indexes must be 1, 2, 3, ... (a restarted node
+// starts again at 1), and every entry must match what any node, this one
+// included, applied at that index before.
+func (c *cluster) read(id int, applyCh <-chan node.ApplyMsg, r reader) {
+	defer close(r.done)
+	next := 1
+	for {
+		var m node.ApplyMsg
+		select {
+		case m = <-applyCh:
+		case <-r.stop:
+			return
+		}
+		if err := c.check(id, m, next); err != nil {
+			c.setErr(err)
+			// Keep draining so the node is never blocked by the checker.
+			continue
+		}
+		next++
+	}
+}
+
+func (c *cluster) check(id int, m node.ApplyMsg, next int) error {
+	if !m.CommandValid {
+		return fmt.Errorf("node %d: ApplyMsg %+v has CommandValid false", id, m)
+	}
+	if m.CommandIndex != next {
+		return fmt.Errorf("node %d: applied index %d, want %d (out of order or a gap)", id, m.CommandIndex, next)
+	}
+	got := applied{cmd: m.Command, term: m.CommandTerm}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if prev, ok := c.agreed[m.CommandIndex]; ok && prev != got {
+		return fmt.Errorf("node %d: applied %q (term %d) at index %d, but %q (term %d) was applied there before",
+			id, got.cmd, got.term, m.CommandIndex, prev.cmd, prev.term)
+	}
+	c.agreed[m.CommandIndex] = got
+	c.logs[id-1][m.CommandIndex] = got
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Cluster control
+
+// crash disconnects node id and kills it, then stops its apply reader. Its
+// persisted state stays. Crashing a crashed node does nothing.
+func (c *cluster) crash(id int) {
+	c.t.Helper()
+	c.disconnect(id)
+	c.mu.Lock()
+	n, r := c.nodes[id-1], c.readers[id-1]
+	c.nodes[id-1] = nil
+	c.mu.Unlock()
+	if n == nil {
+		return
+	}
+	n.Kill()
+	// Kill returned, so the node never sends on applyCh again; anything the
+	// reader has not taken yet belongs to the dead incarnation.
+	close(r.stop)
+	<-r.done
+}
+
+// restart starts a new incarnation of node id from the shared persister
+// (crashing the running one first, if any) and connects it.
+func (c *cluster) restart(id int) {
+	c.t.Helper()
+	c.crash(id)
+	c.mu.Lock()
+	c.starts[id-1]++
+	cfg := node.DefaultConfig()
+	// A different seed per incarnation, so a restarted node does not replay
+	// its previous life's election timeouts.
+	cfg.Seed = c.seed + uint64(c.starts[id-1]-1)
+	cfg.Sink = c.sinks[id-1]
+	c.mu.Unlock()
+
+	applyCh := make(chan node.ApplyMsg)
+	r := reader{stop: make(chan struct{}), done: make(chan struct{})}
+	n := node.Make(id, c.ids, c.net, c.p, applyCh, cfg)
+	go c.read(id, applyCh, r)
+
+	c.mu.Lock()
+	c.nodes[id-1] = n
+	c.readers[id-1] = r
+	c.mu.Unlock()
+	c.connect(id)
+}
+
+// disconnect cuts node id off the network.
+func (c *cluster) disconnect(id int) {
+	c.net.Disconnect(id)
+	c.mu.Lock()
+	c.connected[id-1] = false
+	c.mu.Unlock()
+}
+
+// connect puts node id back on the network.
+func (c *cluster) connect(id int) {
+	c.net.Connect(id)
+	c.mu.Lock()
+	c.connected[id-1] = true
+	c.mu.Unlock()
+}
+
+// setUnreliable turns 10% drops and 0-27 ms delays on or off.
+func (c *cluster) setUnreliable(unreliable bool) {
+	if unreliable {
+		c.net.SetDropRate(0.1)
+		c.net.SetMaxDelay(27 * time.Millisecond)
+	} else {
+		c.net.SetDropRate(0)
+		c.net.SetMaxDelay(0)
+	}
+}
+
+// rpcTotal returns how many messages have been sent so far, replies
+// included.
+func (c *cluster) rpcTotal() int64 { return c.net.MessageCount() }
+
+// rpcCount returns how many requests (RequestVote and AppendEntries) have
+// been sent so far: the number of RPCs, in MIT's terms, where a request and
+// its reply are one RPC.
+func (c *cluster) rpcCount() int64 { return c.net.requests.Load() }
+
+// countingNet is a MemNetwork that also counts requests. Everything but
+// Send comes from the embedded MemNetwork, so it is still a node.Restarter.
+type countingNet struct {
+	*node.MemNetwork
+	requests atomic.Int64
+}
+
+// Send counts m if it is a request, then sends it.
+func (n *countingNet) Send(m core.Message) {
+	if m.Type == core.MsgRequestVote || m.Type == core.MsgAppendEntries {
+		n.requests.Add(1)
+	}
+	n.MemNetwork.Send(m)
+}
+
+// live returns the running, connected nodes by id. Crashed nodes are always
+// disconnected, and a killed node's GetState keeps its last answer, so only
+// these may be asked who leads.
+func (c *cluster) live() map[int]*node.Node {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := map[int]*node.Node{}
+	for i, n := range c.nodes {
+		if n != nil && c.connected[i] {
+			out[i+1] = n
+		}
+	}
+	return out
+}
+
+// ---------------------------------------------------------------------------
+// Checks
+
+// checkOneLeader polls up to 10 times, 450-550 ms apart, for a leader among
+// the connected nodes. It fails if two nodes lead in one term, or if no
+// leader shows up. It returns the leader of the newest term.
+func (c *cluster) checkOneLeader() int {
+	c.t.Helper()
+	for range 10 {
+		time.Sleep(450*time.Millisecond + rand.N(100*time.Millisecond))
+		c.checkApplyErr()
+		leaders := map[int][]int{}
+		for id, n := range c.live() {
+			if term, ok := n.GetState(); ok {
+				leaders[term] = append(leaders[term], id)
+			}
+		}
+		newest := -1
+		for term, ids := range leaders {
+			if len(ids) > 1 {
+				c.t.Fatalf("term %d has %d leaders: %v", term, len(ids), ids)
+			}
+			newest = max(newest, term)
+		}
+		if newest >= 0 {
+			return leaders[newest][0]
+		}
+	}
+	c.t.Fatalf("expected one leader, got none")
+	return 0
+}
+
+// checkNoLeader fails if any connected node thinks it leads.
+func (c *cluster) checkNoLeader() {
+	c.t.Helper()
+	c.checkApplyErr()
+	for id, n := range c.live() {
+		if term, ok := n.GetState(); ok {
+			c.t.Fatalf("expected no leader among connected nodes, but node %d leads in term %d", id, term)
+		}
+	}
+}
+
+// checkTerms fails unless every connected node is in the same term, and
+// returns that term.
+func (c *cluster) checkTerms() int {
+	c.t.Helper()
+	c.checkApplyErr()
+	term := -1
+	for id, n := range c.live() {
+		t, _ := n.GetState()
+		if term == -1 {
+			term = t
+		} else if t != term {
+			c.dumpTermChange(min(t, term))
+			c.t.Fatalf("connected nodes disagree on the term: node %d is in %d, another in %d", id, t, term)
+		}
+	}
+	return term
+}
+
+// nCommitted returns how many nodes (crashed ones included) have applied an
+// entry at index, and its command. It fails if they applied different ones.
+func (c *cluster) nCommitted(index int) (count int, cmd string) {
+	c.t.Helper()
+	count, cmd, err := c.nCommittedErr(index)
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	return count, cmd
+}
+
+// nCommittedErr is nCommitted for goroutines other than the test's own: it
+// returns the failure instead of calling Fatal.
+func (c *cluster) nCommittedErr(index int) (count int, cmd string, err error) {
+	if err := c.applyError(); err != nil {
+		return 0, "", err
+	}
+	var first applied // the value of the first node that applied index
+	firstNode := 0
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i, log := range c.logs {
+		e, ok := log[index]
+		if !ok {
+			continue
+		}
+		if count == 0 {
+			first, firstNode = e, i+1
+		} else if e != first && err == nil {
+			err = fmt.Errorf("committed values differ at index %d: node %d has %q (term %d), node %d has %q (term %d)",
+				index, firstNode, first.cmd, first.term, i+1, e.cmd, e.term)
+		}
+		count++
+	}
+	return count, first.cmd, err
+}
+
+// one submits cmd to whichever connected node is leader, and waits for at
+// least expected nodes to apply it. If the entry is not committed in 2 s and
+// retry is set, it tries again with another leader; without retry it fails.
+// Gives up after 10 s. Returns the index the command was committed at.
+func (c *cluster) one(cmd string, expected int, retry bool) int {
+	c.t.Helper()
+	index, err := c.tryOne(cmd, expected, retry)
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	return index
+}
+
+// tryOne is one for goroutines other than the test's own: it returns the
+// failure instead of calling Fatal.
+func (c *cluster) tryOne(cmd string, expected int, retry bool) (int, error) {
+	t0 := time.Now()
+	next := 0 // round-robin over nodes, as in the MIT tester
+	for time.Since(t0) < oneBudget {
+		if err := c.applyError(); err != nil {
+			return -1, err
+		}
+		index := -1
+		for range c.n {
+			next = next%c.n + 1
+			n, ok := c.live()[next]
+			if !ok {
+				continue
+			}
+			if i, _, isLeader := n.Start(cmd); isLeader {
+				c.mu.Lock()
+				c.nStarts++
+				c.mu.Unlock()
+				index = i
+				break
+			}
+		}
+		if index != -1 {
+			t1 := time.Now()
+			for time.Since(t1) < 2*time.Second {
+				nd, got, err := c.nCommittedErr(index)
+				if err != nil {
+					return -1, err
+				}
+				if nd > 0 && nd >= expected && got == cmd {
+					return index, nil
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+			if !retry {
+				return -1, fmt.Errorf("one(%q) failed to reach agreement", cmd)
+			}
+		} else {
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+	return -1, fmt.Errorf("one(%q) failed to reach agreement in %v", cmd, oneBudget)
+}
+
+// wait waits for at least n nodes to apply index and returns its command.
+// If startTerm >= 0 and some running node's term passes it first, wait
+// returns termMoved, since the entry may never commit.
+func (c *cluster) wait(index, n, startTerm int) string {
+	c.t.Helper()
+	to := 10 * time.Millisecond
+	for range 30 {
+		if nd, _ := c.nCommitted(index); nd >= n {
+			break
+		}
+		time.Sleep(to)
+		if to < time.Second {
+			to *= 2
+		}
+		if startTerm >= 0 {
+			for _, nd := range c.running() {
+				if t, _ := nd.GetState(); t > startTerm {
+					return termMoved
+				}
+			}
+		}
+	}
+	nd, cmd := c.nCommitted(index)
+	if nd < n {
+		c.t.Fatalf("only %d nodes committed index %d, want %d", nd, index, n)
+	}
+	return cmd
+}
+
+// get returns the running incarnation of node id, or nil if it is crashed.
+func (c *cluster) get(id int) *node.Node {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.nodes[id-1]
+}
+
+// isConnected reports whether node id is running and on the network.
+func (c *cluster) isConnected(id int) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.nodes[id-1] != nil && c.connected[id-1]
+}
+
+// running returns every node that is not crashed, connected or not.
+func (c *cluster) running() []*node.Node {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []*node.Node
+	for _, n := range c.nodes {
+		if n != nil {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// ---------------------------------------------------------------------------
+// Cleanup
+
+// cleanup kills every node and stops every reader, then fails the test on
+// any recorded apply error, on an invalid record line or seq gap in any
+// node's sink, or on goroutines left running.
+func (c *cluster) cleanup() {
+	c.t.Helper()
+	for _, id := range c.ids {
+		c.crash(id)
+	}
+	c.mu.Lock()
+	err := c.applyErr
+	c.mu.Unlock()
+	if err != nil {
+		c.t.Errorf("apply check: %v", err)
+	}
+	// One goroutine per node: the schema checks are the slow part of cleanup.
+	sinkErrs := make([]error, len(c.sinks))
+	var wg sync.WaitGroup
+	for i, s := range c.sinks {
+		wg.Go(func() { sinkErrs[i] = checkSink(i+1, &s.MemorySink) })
+	}
+	wg.Wait()
+	for i, err := range sinkErrs {
+		if err != nil {
+			c.t.Errorf("node %d sink: %v", i+1, err)
+		}
+	}
+	c.checkGoroutines(2 * time.Second)
+	c.mu.Lock()
+	starts := c.nStarts
+	c.mu.Unlock()
+	c.t.Logf("%d nodes, %v, %d messages (%d requests), %d commands started",
+		c.n, time.Since(c.begin).Round(time.Millisecond), c.rpcTotal(), c.rpcCount(), starts)
+}
+
+// logKeep is how many entries from each end of a record's log the schema
+// check sees (see checkSink).
+const logKeep = 2
+
+// checkSink validates one node's records against the schema and checks its
+// seqs run 1, 2, 3, ... across all of its incarnations.
+//
+// Every record carries the node's whole log, so validating the records as
+// written costs records × log length, which under -race takes minutes for
+// the long scenarios (Backup, Figure 8). The schema's only rule on a log
+// entry beyond its Go type (LogPair always encodes as [int, string]) is
+// term >= 1, so that is checked here for every entry, and the schema sees
+// each record with its log cut to the first and last logKeep entries.
+func checkSink(id int, s *node.MemorySink) error {
+	var errs []error
+	want := int64(1)
+	for _, r := range s.Records() {
+		if r.Node != id {
+			errs = append(errs, fmt.Errorf("record from node %d", r.Node))
+		}
+		if r.Seq != want {
+			errs = append(errs, fmt.Errorf("seq %d, want %d", r.Seq, want))
+			want = r.Seq
+		}
+		want++
+
+		log := r.State.Log
+		for i, e := range log {
+			if e.Term < 1 {
+				errs = append(errs, fmt.Errorf("seq %d: log entry %d has term %d", r.Seq, i+1, e.Term))
+				break
+			}
+		}
+		if len(log) > 2*logKeep {
+			// r is a copy, but its Log is shared with the sink: build a new one.
+			r.State.Log = slices.Concat(log[:logKeep], log[len(log)-logKeep:])
+		}
+		line, err := tracelog.Marshal(r)
+		if err == nil {
+			err = schemacheck.ValidateLine(line)
+		}
+		if err != nil {
+			errs = append(errs, fmt.Errorf("seq %d: %w", r.Seq, err))
+		}
+		if len(errs) > 10 {
+			errs = append(errs, errors.New("more errors not shown"))
+			break
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// checkGoroutines waits for the goroutine count to fall back to what it
+// was before the cluster started: no node loop, applier or apply reader
+// may outlive cleanup. Delayed-message timers that are still firing are
+// short-lived, so a little waiting covers them.
+func (c *cluster) checkGoroutines(within time.Duration) {
+	c.t.Helper()
+	deadline := time.Now().Add(within)
+	for runtime.NumGoroutine() > c.goros {
+		if time.Now().After(deadline) {
+			buf := make([]byte, 1<<20)
+			buf = buf[:runtime.Stack(buf, true)]
+			c.t.Errorf("goroutine leak: %d running, %d before the cluster started\n%s",
+				runtime.NumGoroutine(), c.goros, buf)
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostics
+
+// timedSink is a MemorySink that also notes when each record was written.
+// Records carry no wall time, and the times are what tell a scheduler stall
+// (a long silence before an election) apart from a protocol bug.
+type timedSink struct {
+	node.MemorySink
+
+	mu    sync.Mutex
+	times []time.Time // times[i] is when the i-th record arrived
+}
+
+// Write notes the time and stores r. Holding mu across both keeps times
+// and records in the same order.
+func (s *timedSink) Write(r tracelog.Record) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.times = append(s.times, time.Now())
+	s.MemorySink.Write(r)
+}
+
+// dumpTermChange logs termChangeReport(fromTerm).
+func (c *cluster) dumpTermChange(fromTerm int) {
+	c.t.Helper()
+	c.t.Log(c.termChangeReport(fromTerm))
+}
+
+// termChangeReport shows, for every node that reached a term above
+// fromTerm, its records around the change: the 30 before the first record
+// in a later term and up to 30 after, each with its time since the cluster
+// started. Nodes that became candidate (their election timer fired) are
+// marked.
+func (c *cluster) termChangeReport(fromTerm int) string {
+	var b strings.Builder
+	for i, s := range c.sinks {
+		s.mu.Lock()
+		recs, times := s.Records(), slices.Clone(s.times)
+		s.mu.Unlock()
+		first := slices.IndexFunc(recs, func(r tracelog.Record) bool { return r.Term > fromTerm })
+		if first < 0 {
+			continue
+		}
+		timedOut := slices.ContainsFunc(recs[first:], func(r tracelog.Record) bool {
+			return r.Event == tracelog.EvBecomeCandidate
+		})
+		lo, hi := max(0, first-30), min(len(recs), first+30)
+		fmt.Fprintf(&b, "node %d left term %d (election timer fired: %v); records %d-%d of %d:\n",
+			i+1, fromTerm, timedOut, lo+1, hi, len(recs))
+		for j := lo; j < hi; j++ {
+			line, err := tracelog.Marshal(recs[j])
+			if err != nil {
+				line = []byte(err.Error())
+			}
+			fmt.Fprintf(&b, "  +%v %s\n", times[j].Sub(c.begin).Round(time.Millisecond), line)
+		}
+	}
+	return b.String()
+}
