@@ -29,6 +29,7 @@ type committedEntry struct {
 
 type invariants struct {
 	leaders   map[int]int              // term -> leader id (rule 1)
+	started   map[[2]int]bool          // {node, term} pairs with a become_candidate record
 	committed map[int]committedEntry   // index -> committed entry (rule 3)
 	applied   map[int]tracelog.LogPair // index -> applied entry (rule 4)
 	appliedBy map[int]int              // index -> first node that applied it
@@ -37,6 +38,7 @@ type invariants struct {
 func newInvariants() *invariants {
 	return &invariants{
 		leaders:   map[int]int{},
+		started:   map[[2]int]bool{},
 		committed: map[int]committedEntry{},
 		applied:   map[int]tracelog.LogPair{},
 		appliedBy: map[int]int{},
@@ -54,10 +56,15 @@ func (iv *invariants) checkInvariants(recs []tracelog.Record, live []liveNode) e
 			if err = iv.electionSafety(r); err == nil {
 				err = iv.leaderHasCommitted(r)
 			}
+		case tracelog.EvBecomeCandidate:
+			iv.started[[2]int{r.Node, r.State.CurrentTerm}] = true
 		case tracelog.EvAdvanceCommit:
 			err = iv.addCommitted(r)
 		case tracelog.EvApplyEntry:
 			err = iv.stateMachineSafety(r)
+		}
+		if err == nil {
+			err = iv.roleEarned(r)
 		}
 		if err != nil {
 			return fmt.Errorf("node %d seq %d %s: %w", r.Node, r.Seq, r.Event, err)
@@ -72,6 +79,27 @@ func (iv *invariants) electionSafety(r tracelog.Record) error {
 		return fmt.Errorf("election safety: term %d has two leaders, nodes %d and %d", r.Term, prev, r.Node)
 	}
 	iv.leaders[r.Term] = r.Node
+	return nil
+}
+
+// roleEarned checks every record's snapshot: a leader at term T must be the
+// node that recorded become_leader for T, and a candidate at term T must
+// have recorded become_candidate at T. A snapshot showing a leader or
+// candidate in a term the node never won or started is not a real state,
+// and a checker reading snapshots would see a false election-safety
+// violation in it.
+func (iv *invariants) roleEarned(r tracelog.Record) error {
+	t := r.State.CurrentTerm
+	switch r.State.Role {
+	case "leader":
+		if l, ok := iv.leaders[t]; !ok || l != r.Node {
+			return fmt.Errorf("role check: snapshot shows a leader in term %d, but the node never recorded become_leader for it", t)
+		}
+	case "candidate":
+		if !iv.started[[2]int{r.Node, t}] {
+			return fmt.Errorf("role check: snapshot shows a candidate in term %d, but the node never recorded become_candidate for it", t)
+		}
+	}
 	return nil
 }
 

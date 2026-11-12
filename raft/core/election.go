@@ -32,23 +32,25 @@ func (n *Node) receive(m Message) {
 	}
 }
 
-// observeTerm is the higher-term rule (rule 1). If term > currentTerm it sets
-// currentTerm = term, votedFor = 0 and leaderId = 0, and records update_term
-// {old_term, from}; if the node was a candidate or leader it then becomes a
-// follower and records become_follower {old_role}. A term <= currentTerm
-// changes nothing.
+// observeTerm is the higher-term rule (rule 1). If term > currentTerm it
+// first makes the whole step-down: currentTerm = term, votedFor = 0,
+// leaderId = 0 and role = follower (dropping candidate and leader state).
+// Only then does it record update_term {old_term, from} and, if the node was
+// a candidate or leader, become_follower {old_role}. So both snapshots show
+// a follower in the new term, never a leader or candidate of a term it did
+// not win or start (the TLA+ UpdateTerm action changes all of these at
+// once). A term <= currentTerm changes nothing.
 func (n *Node) observeTerm(term, from int) {
 	if term <= n.currentTerm {
 		return
 	}
-	old := n.currentTerm
+	old, oldRole := n.currentTerm, n.role
 	n.setTerm(term)
 	n.setVote(0)
 	n.leaderID = 0
+	n.becomeFollower()
 	n.record(tracelog.EvUpdateTerm, map[string]any{"old_term": old, "from": from})
-	if n.role != Follower {
-		oldRole := n.role
-		n.becomeFollower()
+	if oldRole != Follower {
 		n.record(tracelog.EvBecomeFollower, map[string]any{"old_role": oldRole.String()})
 	}
 }

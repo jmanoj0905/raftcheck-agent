@@ -551,3 +551,54 @@ func TestElectionJSONLIsDeterministic(t *testing.T) {
 		t.Errorf("schema: %v", err)
 	}
 }
+
+// TestStepDownSnapshotsAreFollower pins the order inside the higher-term
+// rule: the whole step-down happens before update_term is recorded, so the
+// update_term and become_follower snapshots both show a follower in the new
+// term. No record of the step may show a leader or candidate in a term the
+// node never won or started.
+func TestStepDownSnapshotsAreFollower(t *testing.T) {
+	msgs := map[string]func(term int) Event{
+		"RequestVote":        func(term int) Event { return requestVote(2, 1, term, 9, 9, "2-7") },
+		"RequestVoteReply":   func(term int) Event { return voteReply(2, 1, term, false, "2-7") },
+		"AppendEntries":      func(term int) Event { return appendEntries(2, 1, term, 0, 0, nil, 0, "2-7") },
+		"AppendEntriesReply": func(term int) Event { return appendReply(2, 1, term, false, 0, 0, "2-7") },
+	}
+	setups := map[string]func(t *testing.T) *Node{
+		"leader": func(t *testing.T) *Node { return leaderOfTerm(t, 1) },
+		"candidate": func(t *testing.T) *Node {
+			n := New(1, []int{1, 2, 3})
+			step(t, n, ElectionTimeout{})
+			return n
+		},
+	}
+	for _, role := range []string{"leader", "candidate"} {
+		for _, kind := range []string{"RequestVote", "RequestVoteReply", "AppendEntries", "AppendEntriesReply"} {
+			t.Run(role+"/"+kind, func(t *testing.T) {
+				n := setups[role](t)
+				wonTerm := n.currentTerm // the term it became leader or candidate in
+				out := step(t, n, msgs[kind](2))
+				if got := recordEvents(out)[:2]; !reflect.DeepEqual(got, []string{tracelog.EvUpdateTerm, tracelog.EvBecomeFollower}) {
+					t.Fatalf("first events = %v, want update_term, become_follower", got)
+				}
+				if d := out.Records[1].Details; !reflect.DeepEqual(d, map[string]any{"old_role": role}) {
+					t.Errorf("become_follower details = %v", d)
+				}
+				for _, r := range out.Records[:2] {
+					st := r.State
+					if st.Role != "follower" || st.CurrentTerm != 2 || r.Term != 2 || st.VotedFor != 0 ||
+						st.LeaderID != 0 || st.NextIndex != nil || st.MatchIndex != nil {
+						t.Errorf("%s snapshot = %+v (term %d), want a follower in term 2 with no vote, leader or maps",
+							r.Event, st, r.Term)
+					}
+				}
+				for _, r := range out.Records {
+					if r.State.Role != "follower" && r.State.CurrentTerm > wonTerm {
+						t.Errorf("seq %d %s shows a %s in term %d, but the node only reached term %d as %s",
+							r.Seq, r.Event, r.State.Role, r.State.CurrentTerm, wonTerm, role)
+					}
+				}
+			})
+		}
+	}
+}

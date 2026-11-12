@@ -163,6 +163,46 @@ func TestInvariantCatchesTwoLeaders(t *testing.T) {
 	wantErr(t, iv.checkInvariants([]tracelog.Record{two}, nil), "election safety", "term 3")
 }
 
+func TestInvariantCatchesUnearnedRole(t *testing.T) {
+	withRole := func(r tracelog.Record, role string) tracelog.Record {
+		r.State.Role = role
+		return r
+	}
+	iv := newInvariants()
+	ok := []tracelog.Record{
+		withRole(rec(1, tracelog.EvBecomeCandidate, 2, map[string]any{"old_role": "follower"}), "candidate"),
+		withRole(rec(1, tracelog.EvPersist, 2, map[string]any{"log_len": 0}), "candidate"),
+		withRole(rec(1, tracelog.EvBecomeLeader, 2, map[string]any{"votes": []int{1, 2}}), "leader"),
+		withRole(rec(1, tracelog.EvSendAppendEntries, 2, nil), "leader"),
+	}
+	if err := iv.checkInvariants(ok, nil); err != nil {
+		t.Fatalf("earned roles: %v", err)
+	}
+	// The bug Important 1 fixed: a leader of term 2 records update_term for
+	// term 3 before stepping down.
+	wantErr(t, iv.checkInvariants([]tracelog.Record{
+		withRole(rec(1, tracelog.EvUpdateTerm, 3, map[string]any{"old_term": 2, "from": 2}), "leader"),
+	}, nil), "role check", "leader in term 3")
+	// Another node's become_leader does not cover node 2.
+	wantErr(t, newInvariants().checkInvariants([]tracelog.Record{
+		withRole(rec(1, tracelog.EvBecomeLeader, 2, nil), "leader"),
+		withRole(rec(2, tracelog.EvRecvVoteReply, 2, nil), "leader"),
+	}, nil), "role check", "leader in term 2")
+	// A candidate needs its own become_candidate in that term.
+	iv = newInvariants()
+	if err := iv.checkInvariants([]tracelog.Record{
+		withRole(rec(1, tracelog.EvBecomeCandidate, 2, nil), "candidate"),
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	wantErr(t, iv.checkInvariants([]tracelog.Record{
+		withRole(rec(1, tracelog.EvUpdateTerm, 3, nil), "candidate"),
+	}, nil), "role check", "candidate in term 3")
+	wantErr(t, iv.checkInvariants([]tracelog.Record{
+		withRole(rec(3, tracelog.EvRecvVoteReply, 2, nil), "candidate"),
+	}, nil), "role check", "candidate in term 2")
+}
+
 func TestInvariantCatchesLogMismatch(t *testing.T) {
 	iv := newInvariants()
 	good := []liveNode{
