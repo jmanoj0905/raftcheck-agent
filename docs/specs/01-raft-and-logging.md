@@ -1,6 +1,6 @@
 # Spec 1: Raft Implementation + Structured Logging
 
-Status: Draft v1 · 2026-11-11 · Author: Manoj J
+Status: Draft v1 · 2026-11-11 · Author: Manoj J · Updated 2026-11-12 to match what got built (final review)
 Parent: [design.md](../design.md), component A
 Depends on: nothing · Needed by: Spec 2 (runner), Spec 3 (testbed), Spec 5 (checker)
 
@@ -53,6 +53,8 @@ These are choices I made while writing this spec. Each one has a reason. If you 
 | JSON Schema | A file that describes exactly which fields a JSON record must have. Python (Spec 5) uses it to validate log lines. |
 | Hash | A short fingerprint of some data. Same data → same hash. |
 | Figure 8 | The scenario in Figure 8 of the Raft paper: a leader must not commit an old-term entry just by counting copies. A classic bug source. |
+| Epoch | A "life number" the in-memory network keeps per node. It goes up when the node is disconnected or restarted, so messages from an older life can be thrown away. |
+| Lexicographic order | Dictionary order for text: strings are compared character by character, so `"10"` comes before `"2"`. |
 
 ---
 
@@ -140,15 +142,18 @@ Crash and restart are **not** core events. A crash means throwing the core away.
 
 Every message also has `From`, `To`, and a `MsgID`. (`candidateId` and `leaderId` are simply `From`.) The `MsgID` is `"<from>-<per-node counter>"` (e.g. `"2-17"`) and comes from the message counter in `Counters` (D6), so IDs stay unique across restarts. The runner (Spec 2) uses `MsgID` to say "deliver message 2-17".
 
+Replies (`RequestVoteReply`, `AppendEntriesReply`) get a `MsgID` too, but no `send_*` record. Instead, the `recv_request_vote` or `recv_append_entries` record of the request being answered carries the reply's id as `reply_msg_id` (section 6.3). Every such record sends exactly one reply, rejections included.
+
 ### 4.4 Output of each step
 
 ```
 Step(event) → Output{
     Persist  *PersistentState   // nil = nothing changed; otherwise save this BEFORE sending
     Messages []Message          // in a fixed, deterministic order (sorted by To)
-    Apply    []Entry + index     // newly committed entries to hand to the application, in order
+    Apply    []Applied          // Applied{Index, Term, Command}: newly committed entries, in order
     Records  []tracelog.Record  // the log lines for this step (section 6)
     ResetElectionTimer bool     // true = restart this node's election timer (rule 6 in 4.5)
+    Proposed *ProposeResult     // set only for a Propose event: (index, term, isLeader) for Start()
 }
 ```
 
@@ -158,7 +163,7 @@ Step(event) → Output{
 
 These are exactly the rules in Figure 2 of the Raft paper, with the choices below made explicit:
 
-1. **Any message with a higher term** → set `currentTerm` to it, set `votedFor = 0`, become follower, and *then* handle the message.
+1. **Any message with a higher term** → set `currentTerm` to it, set `votedFor = 0` and `leaderId = 0`, become follower, and *then* handle the message. All of these changes happen together (like the TLA+ `UpdateTerm` action), and only then are `update_term` and (if the role changed) `become_follower` recorded. So both snapshots show a follower in the new term, never a leader or candidate of a term the node did not win or start.
 2. **Messages with a lower term** → reply with the current term and `false` (for requests), or ignore (for replies).
 3. **ElectionTimeout** (follower or candidate) → term + 1, vote for self, become candidate, send RequestVote to every peer. With 1 node, it becomes leader straight away.
 4. **Granting a vote**: only if `votedFor` is 0 or the candidate, **and** the candidate's log is at least as up-to-date (compare last term first, then last index).
@@ -167,13 +172,14 @@ These are exactly the rules in Figure 2 of the Raft paper, with the choices belo
 7. **AppendEntries on a follower**: reject if `prevLogIndex` is missing or has a different term. Otherwise delete any **conflicting** entries (same index, different term) and the entries after them, append any new entries, and set `commitIndex = min(leaderCommit, index of last new entry)`. **Never** cut off entries that match (a classic bug).
 8. **Leader on reply**: on success, update `matchIndex` and `nextIndex`. On failure (same term), decrease `nextIndex` by 1 (D5) and resend.
 9. **Commit rule (leader)**: move `commitIndex` to N if a majority have `matchIndex ≥ N` **and** `log[N].term == currentTerm`. The second condition is the Figure 8 rule.
-10. **Propose** on a leader: append `{currentTerm, command}`, send AppendEntries to all peers, return `(index, term, true)`. On a non-leader: return `(0, currentTerm, false)` and change nothing.
+10. **Propose** on a leader: append `{currentTerm, command}`, send AppendEntries to all peers, return `(index, term, true)`. On a non-leader: return `(0, currentTerm, false)`, change no state, and write one `propose_rejected` record.
 11. **Apply**: whenever `commitIndex > lastApplied`, output entries `lastApplied+1 … commitIndex` and advance `lastApplied`.
 
 ### 4.6 Crash and restart
 
 - `PersistentState = {currentTerm, votedFor, log}`. `Counters = {lastSeq, lastMsg}` (D6), read with `node.Counters()` after each step.
 - `Restore(id, peers, state, counters)` builds a follower with that state and returns it with an `Output` holding the `restart` record. All volatile state is reset (`commitIndex = 0`, `lastApplied = 0`).
+- The caller decides when to restore. The wrapper's `Make` restores whenever there is saved state **or** the saved counters are non-zero, even with no saved state: a node killed before it ever saved still has counters (its `crash` record bumped `seq`), and starting it fresh would reuse `seq` numbers.
 - After a restart, already-committed entries are applied again from index 1 once `commitIndex` catches up. This matches MIT's behaviour, and the test kit handles it.
 
 ---
@@ -190,7 +196,8 @@ func (n *Node) Kill()
 ```
 
 - One goroutine per node owns the core. Every event (timer, incoming message, `Start` call) goes through **one channel**, so the core is only ever touched by one goroutine and needs no mutex inside it.
-- Election timeout: random within `[ElectionMin, ElectionMax]` (default 300–600 ms). Heartbeat: every `HeartbeatInterval` (default 100 ms). All values are in `Config`, and the random source can be seeded.
+- Election timeout: random in the half-open range `[ElectionMin, ElectionMax)` (at least `ElectionMin`, always below `ElectionMax`; default 300–600 ms). Heartbeat: every `HeartbeatInterval` (default 100 ms). All values are in `Config`, and the random source can be seeded.
+- On a restart (see 4.6), `Make` first throws away what the old life left behind. If the transport also implements the optional `Restarter` interface, `Make` calls `Restart(id)`, which clears the inbox and every message still in flight to or from the old life. Otherwise it only drains the inbox, so a late message may still arrive.
 - Follows the output ordering rule (persist → send → apply) and the `ResetElectionTimer` flag.
 - Writes every `Record` from the output to a `RecordSink` (a file, or memory in tests).
 
@@ -207,9 +214,12 @@ type Persister interface {
     SaveCounters(id int, c core.Counters)   // after every step (D6)
     LoadCounters(id int) core.Counters
 }
+type Restarter interface {                  // optional, for transports
+    Restart(id int)                         // forget everything sent to or by id's old life
+}
 ```
 
-In-memory implementations ship with this spec. The in-memory transport supports, for tests only: drop rate, extra delay, reordering, and disconnecting a node. Spec 2's simulator does **not** use the wrapper. It calls `core.Step` directly.
+In-memory implementations ship with this spec. The in-memory transport (`MemNetwork`) supports, for tests only: drop rate, extra delay, reordering, and disconnecting a node. It gives every node an **epoch**, which goes up on `Disconnect` and on `Restart`. Each message is stamped with the sender's and receiver's epochs when it is sent, and is delivered only if both are unchanged. So `Disconnect` drops the messages already in flight for good (reconnecting does not bring them back), and a restarted node never sees a message from its old life. `MemNetwork` is a `Restarter`. Spec 2's simulator does **not** use the wrapper. It calls `core.Step` directly.
 
 ---
 
@@ -219,7 +229,15 @@ In-memory implementations ship with this spec. The in-memory transport supports,
 
 - One JSON record per line (JSONL), UTF-8.
 - Produced by the **core** inside `Output.Records`, so log lines are deterministic as well.
-- One record for **each state change**, written **after** the change. Several records can come from one step (e.g. `update_term` then `become_follower` then `grant_vote`).
+- One record for **each state change**, written **after** the change. Several records can come from one step (e.g. `update_term` then `become_follower` then `recv_request_vote`).
+- In the higher-term rule (4.5 rule 1), the whole step-down happens first, so the `update_term` and `become_follower` snapshots both show the state **after** it: a follower in the new term with no vote and no leader.
+- **Order within one step:**
+  1. the handler's records, in the order the changes happen;
+  2. `persist`, after all handler records (only if term, vote or log changed);
+  3. `send_request_vote` / `send_append_entries`, one per request, sorted by `to` (replies have no `send_*` record);
+  4. `apply_entry`, one per newly committed entry.
+
+  Because each record comes after its own change, a follower writes `advance_commit` **before** `recv_append_entries`, and a leader writes `recv_append_reply` **before** `advance_commit`.
 
 ### 6.2 Fields in every record
 
@@ -244,10 +262,10 @@ The **runner adds** `step` (global step number) and `cause` (the event or messag
 | `become_candidate` | election started | `old_role` |
 | `become_leader` | won election | `votes` (sorted list of ids) |
 | `send_request_vote` | RequestVote sent | `to`, `msg_id`, `last_log_index`, `last_log_term` |
-| `recv_request_vote` | RequestVote handled | `from`, `msg_id`, `granted`, `reason` (`ok`/`stale_term`/`already_voted`/`log_not_up_to_date`) |
+| `recv_request_vote` | RequestVote handled | `from`, `msg_id`, `granted`, `reason` (`ok`/`stale_term`/`already_voted`/`log_not_up_to_date`), `reply_msg_id` (the `MsgID` of the reply this step sends) |
 | `recv_vote_reply` | vote reply handled | `from`, `msg_id`, `granted` |
 | `send_append_entries` | AppendEntries sent | `to`, `msg_id`, `prev_log_index`, `prev_log_term`, `n_entries`, `leader_commit` |
-| `recv_append_entries` | AppendEntries handled | `from`, `msg_id`, `success`, `reason` (`ok`/`stale_term`/`log_mismatch`) |
+| `recv_append_entries` | AppendEntries handled | `from`, `msg_id`, `success`, `reason` (`ok`/`stale_term`/`log_mismatch`), `reply_msg_id` (the `MsgID` of the reply this step sends) |
 | `recv_append_reply` | reply handled by leader | `from`, `msg_id`, `success`, `match_index` |
 | `append_entry` | entry added to own log | `index`, `entry_term`, `command` |
 | `truncate_log` | conflicting entries removed | `from_index`, `removed` (count) |
@@ -256,6 +274,8 @@ The **runner adds** `step` (global step number) and `cause` (the event or messag
 | `persist` | output contained persistent state | `log_len` |
 | `restart` | node rebuilt from saved state | `restored_term`, `restored_log_len` |
 | `propose_rejected` | `Propose` on a non-leader | `command` |
+
+Replies get no `send_*` record. To follow a reply, match the `msg_id` in the leader's or candidate's `recv_append_reply` / `recv_vote_reply` with the `reply_msg_id` in the other node's `recv_append_entries` / `recv_request_vote`. Every one of these two `recv_*` records sends exactly one reply, including `stale_term` and `log_mismatch` rejections.
 
 A `crash` record is written by the runner or wrapper, not the core, because the core is just thrown away. Format: same fields, `event: "crash"`, `details: {}`, and `state` as last known.
 
@@ -276,7 +296,7 @@ A `crash` record is written by the runner or wrapper, not the core, because the 
 ```
 
 - `log` lists the **full** log as `[term, command]` pairs. Logs in testing are short (≤ ~10 entries), and the conformance checker needs the whole thing.
-- `next_index` / `match_index` are present only on leaders. Keys are sorted.
+- `next_index` / `match_index` are present only on leaders. Keys are sorted in lexicographic order (`"10"` before `"2"`), because they are JSON strings. A leader of a 1-node cluster has no other peers, so its maps are empty and are left out (empty maps are dropped by `omitempty`, Go's "leave out if empty" option).
 - JSON keys are written in a fixed order, so the same run gives **byte-identical** files.
 
 ### 6.5 Example (node 2 wins an election in term 5)
@@ -340,6 +360,14 @@ The test kit is a tiny deterministic driver used **only for tests**. It is not S
 3. Leader completeness.
 4. State machine safety (no two nodes apply different commands at the same index).
 
+Rules 1 and 3 are checked from the records as they appear: each `become_leader` record is checked against earlier leaders of that term (rule 1) and against everything committed so far (rule 3), and each `advance_commit` record adds the entries it commits. Leader completeness is checked only for leaders of terms **later** than the term an entry was committed in, as in the Raft paper (§5.4: "present in the logs of the leaders for all higher-numbered terms"). A slow candidate of an older term can still win after a newer term committed something.
+
+It also checks every record's snapshot: a record showing a leader in term T must come from the node that recorded `become_leader` for T, and a record showing a candidate in term T must come after that node's `become_candidate` in T. Each reply sent must be named by exactly one `reply_msg_id` in the same step.
+
+**Messages across restarts:** in the test kit, a crash does not remove messages already in flight. Messages sent to or by a node's old life can still be delivered after it restarts. This is on purpose (a real network can deliver late messages), and it is unlike the wrapper's `MemNetwork`, which drops them (section 5).
+
+**Random-walk weights** (out of 100, decided by the user on 2026-11-11): deliver 58, heartbeat 15, propose 10, drop 5, duplicate 5, timeout 2, crash 2.5, restart 2.5. The first plan had timeout 10 and deliver 50, but then a timeout knocked the leader out before it could replicate, and 92 of 100 five-node seeds never committed anything. `TestWalkCoverage` fails if the walk goes weak again (too few seeds commit, or no commits or log truncations happen at all).
+
 Runs: 3 and 5 nodes, 1,000 seeds × 2,000 steps each, in CI (Continuous Integration: tests run automatically on every push) with fewer seeds, and a longer "soak" run by hand. On failure it prints the seed and the event list, so the failure can be replayed.
 
 ### 8.3 Scenario tests through the wrapper (MIT style, real goroutines and timers)
@@ -348,10 +376,12 @@ Our own versions of the MIT Lab 3A–3C scenarios (D4): initial election; re-ele
 
 All must pass **with Go's race detector on** (`go test -race`), and **100 times in a row** without a single failure (flaky tests count as failing).
 
+Figure 8 on an unreliable network runs **50 rounds** (30 under `-short`), not MIT's 1,000 (decided by the user on 2026-11-11). Because of D5 (step back by one), a lagging follower catches up one entry per round trip, so 1,000 rounds would take far too long.
+
 ### 8.4 Log-line tests
 
 - Every record from 8.1–8.3 validates against `schema.json`.
-- For every step, the `state` in the **last** record of that step equals the core's real state.
+- After **every** test kit action, for **every** live node, the node's real state equals the `state` in the last record that node wrote, whether or not it wrote one in this action. This also catches a state change with no record after it (6.1).
 - Spot checks: each event type in 6.3 appears at least once across the test suite.
 
 ---
