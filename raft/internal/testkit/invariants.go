@@ -212,18 +212,31 @@ func (iv *invariants) stateMachineSafety(r tracelog.Record) error {
 	return nil
 }
 
-// checkRecordedState is the §8.4 check: if node id wrote records in this
-// step, the state in the last of them equals the node's real state.
-func checkRecordedState(id int, st tracelog.State, recs []tracelog.Record) error {
-	for i := len(recs) - 1; i >= 0; i-- {
-		if recs[i].Node != id {
-			continue
-		}
-		if !reflect.DeepEqual(recs[i].State, st) {
-			return fmt.Errorf("node %d: state in last record (seq %d %s) is %+v, real state is %+v",
-				id, recs[i].Seq, recs[i].Event, recs[i].State, st)
-		}
-		return nil
+// lastRecord is the newest record a node has written: its snapshot and where
+// it came from. A fresh node that has written nothing yet has seq 0 and its
+// starting state.
+type lastRecord struct {
+	State tracelog.State
+	Seq   int64
+	Event string
+}
+
+// noteRecords moves each node's lastRecord forward over one action's
+// records, in order.
+func noteRecords(last []lastRecord, recs []tracelog.Record) {
+	for _, r := range recs {
+		last[r.Node-1] = lastRecord{State: r.State, Seq: r.Seq, Event: r.Event}
+	}
+}
+
+// checkRecordedState is the §8.4 check, run for every live node after every
+// action: the node's real state equals the snapshot in the last record it
+// wrote, whether or not it wrote one in this action. So a state change with
+// no record after it (spec §6.1) is caught too.
+func checkRecordedState(id int, st tracelog.State, last lastRecord) error {
+	if !reflect.DeepEqual(last.State, st) {
+		return fmt.Errorf("node %d: state in its last record (seq %d %s) is %+v, real state is %+v",
+			id, last.Seq, last.Event, last.State, st)
 	}
 	return nil
 }

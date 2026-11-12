@@ -3,7 +3,7 @@
 // cores, the saved state of each node and the messages in flight; every
 // action steps at most one core, applies its Output in the order persist ->
 // counters -> messages -> apply -> records, and then checks the four safety
-// rules and the §8.4 recorded-state rule.
+// rules and the §8.4 recorded-state rule for every live node.
 package testkit
 
 import (
@@ -26,6 +26,7 @@ type Cluster struct {
 	counters []core.Counters
 	inFlight []core.Message
 	records  []tracelog.Record
+	lastRec  []lastRecord // per node, the newest record it wrote (§8.4 check)
 	actions  []string
 	inv      *invariants
 }
@@ -39,6 +40,7 @@ func NewCluster(n int) *Cluster {
 		nodes:    make([]*core.Node, n),
 		saved:    make([]core.PersistentState, n),
 		counters: make([]core.Counters, n),
+		lastRec:  make([]lastRecord, n),
 		inv:      newInvariants(),
 	}
 	for id := 1; id <= n; id++ {
@@ -47,6 +49,7 @@ func NewCluster(n int) *Cluster {
 	for i, id := range c.ids {
 		c.nodes[i] = core.New(id, c.ids)
 		c.saved[i] = core.PersistentState{Log: []core.Entry{}}
+		c.lastRec[i] = lastRecord{State: c.nodes[i].State(), Event: "(fresh node)"}
 	}
 	return c
 }
@@ -284,13 +287,14 @@ func checkReplyLinks(out core.Output) error {
 // done logs action and runs the checks on this step's records.
 func (c *Cluster) done(action string, recs []tracelog.Record) error {
 	c.actions = append(c.actions, action)
+	noteRecords(c.lastRec, recs)
 	var live []liveNode
 	for i, n := range c.nodes {
 		if n == nil {
 			continue
 		}
 		st := n.State()
-		if err := checkRecordedState(c.ids[i], st, recs); err != nil {
+		if err := checkRecordedState(c.ids[i], st, c.lastRec[i]); err != nil {
 			return c.fail(err)
 		}
 		live = append(live, liveNode{ID: c.ids[i], State: st})

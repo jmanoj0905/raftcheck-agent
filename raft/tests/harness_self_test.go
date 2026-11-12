@@ -152,3 +152,22 @@ func TestCheckSink(t *testing.T) {
 		}
 	}
 }
+
+// TestNCommittedNamesBothNodes checks that a disagreement is reported with
+// the first node that applied the index and the node that differs from it.
+func TestNCommittedNamesBothNodes(t *testing.T) {
+	c := &cluster{logs: []map[int]applied{
+		{},
+		{1: {"a", 1}},
+		{1: {"a", 1}},
+		{1: {"b", 2}},
+	}}
+	count, cmd, err := c.nCommittedErr(1)
+	if count != 3 || cmd != "a" {
+		t.Errorf("nCommittedErr(1) = (%d, %q), want (3, a)", count, cmd)
+	}
+	want := `committed values differ at index 1: node 2 has "a" (term 1), node 4 has "b" (term 2)`
+	if err == nil || err.Error() != want {
+		t.Errorf("error = %v, want %s", err, want)
+	}
+}

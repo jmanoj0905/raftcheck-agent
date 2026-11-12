@@ -110,7 +110,7 @@ func TestCrashAndRestartContinueSeq(t *testing.T) {
 		}
 	}
 	crash := slices.Index(events, tracelog.EvCrash)
-	if crash < 0 || events[crash+1] != tracelog.EvRestart || crash+2 != len(events) {
+	if crash < 0 || crash+2 != len(events) || events[crash+1] != tracelog.EvRestart {
 		t.Fatalf("node 1 events end %v, want ... crash, restart", events)
 	}
 	rec := c.Records()[slices.IndexFunc(c.Records(), func(r tracelog.Record) bool { return r.Event == tracelog.EvCrash })]
@@ -287,13 +287,37 @@ func TestRecordedStateCheck(t *testing.T) {
 	r1 := rec(1, tracelog.EvBecomeCandidate, 2, nil)
 	r2 := rec(1, tracelog.EvBecomeLeader, 2, nil)
 	r2.State = st
-	if err := checkRecordedState(1, st, []tracelog.Record{r1, r2}); err != nil {
+	other := rec(2, tracelog.EvPersist, 2, nil)
+	last := make([]lastRecord, 2)
+	noteRecords(last, []tracelog.Record{r1, r2, other})
+	if err := checkRecordedState(1, st, last[0]); err != nil {
 		t.Fatal(err)
 	}
-	if err := checkRecordedState(1, st, nil); err != nil {
-		t.Fatalf("no records: %v", err)
+	// An action with no record by node 1 still compares against its last
+	// record, so a change made without a record is caught.
+	noteRecords(last, nil)
+	if err := checkRecordedState(1, st, last[0]); err != nil {
+		t.Fatalf("no new records, same state: %v", err)
 	}
-	wantErr(t, checkRecordedState(1, st, []tracelog.Record{r2, r1}), "node 1", "state")
+	changed := st
+	changed.CommitIndex = 1
+	wantErr(t, checkRecordedState(1, changed, last[0]), "node 1", "last record", "become_leader")
+	noteRecords(last, []tracelog.Record{r2, r1})
+	wantErr(t, checkRecordedState(1, st, last[0]), "node 1", "become_candidate")
+}
+
+// TestUnrecordedChangeIsCaught changes a core's state behind the test kit's
+// back (with no record) and checks that the next action, even one where
+// that node writes nothing, reports it.
+func TestUnrecordedChangeIsCaught(t *testing.T) {
+	c := NewCluster(3)
+	if err := c.Timeout(1); err != nil {
+		t.Fatal(err)
+	}
+	// A heartbeat on a non-leader writes no record. Before it, make node 3
+	// a candidate without any record by stepping its core directly.
+	c.nodes[2].Step(core.ElectionTimeout{})
+	wantErr(t, c.Heartbeat(2), "node 3", "last record", "real state")
 }
 
 func TestRandomSafety(t *testing.T) {

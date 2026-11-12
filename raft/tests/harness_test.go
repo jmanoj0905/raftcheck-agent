@@ -381,7 +381,8 @@ func (c *cluster) nCommittedErr(index int) (count int, cmd string, err error) {
 	if err := c.applyError(); err != nil {
 		return 0, "", err
 	}
-	var first applied
+	var first applied // the value of the first node that applied index
+	firstNode := 0
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for i, log := range c.logs {
@@ -389,11 +390,12 @@ func (c *cluster) nCommittedErr(index int) (count int, cmd string, err error) {
 		if !ok {
 			continue
 		}
-		if count > 0 && e != first && err == nil {
-			err = fmt.Errorf("committed values differ at index %d: node %d has %q (term %d), another has %q (term %d)",
-				index, i+1, e.cmd, e.term, first.cmd, first.term)
+		if count == 0 {
+			first, firstNode = e, i+1
+		} else if e != first && err == nil {
+			err = fmt.Errorf("committed values differ at index %d: node %d has %q (term %d), node %d has %q (term %d)",
+				index, firstNode, first.cmd, first.term, i+1, e.cmd, e.term)
 		}
-		first = e
 		count++
 	}
 	return count, first.cmd, err
